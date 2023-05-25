@@ -1,0 +1,898 @@
+```{r setup}
+library(pacman)
+p_load(data.table, dplyr, ggplot2, foreach, 
+GenomicRanges, yaml, purrr, fs, stringr, tximport, edgeR, tidyr, ggseqlogo, corrplot,
+factoextra, ggstatsplot, tidyverse, ggpubr, GEOquery, rtracklayer, gridExtra, 
+rstatix, ggprism, rtracklayer, knitr, patchwork, ggcorrplot, Rsamtools, tidytext)
+outdatadir <- "output/code/prepdata/"
+grafikai <- "output/code/prepdata/grafikai/"
+options(scipen=999)
+knitr::opts_chunk$set(echo = TRUE, fig.width = 20, fig.height = 12)
+
+
+# Funkcijos 
+bin <- function(dt, bins = 500) {
+    dt <- dt %>% mutate(binID = paste0(seqnames,"_", floor(start/bins)))
+    return(dt)
+}
+
+regionbin <- function(dt) {
+  dt[, regionID := paste0(seqnames, "_", start,"_", end)]
+  return(dt)
+}
+
+give.n <- function(x){
+  return(c(y = median(x)*1.10, label = length(x))) }
+
+# Failai
+file_names <- fs::dir_ls("/mnt/store/DMTS/mESC_openChrom/regions/", regexp = "Final")
+#dtuCG <- readRDS("/mnt/store/DMTS/mESC_openChrom/regions/Cov_data_triple.RDS")
+#total <- dtuCG$total
+#saveRDS(total, "./input/total.RDS")
+#total <- total %>% as.data.table() %>% setnames("TT_S0", "TT_S0_deep") 
+pavadinimai <- c("lGC", "lGCCG", "gGC", "gGCCG")
+```
+
+# uCG signalas elementuose
+
+```{r}
+### ANOTACIJOS LENTELĖS KŪRIMAS
+outFile <- paste0(outdatadir, "anotacija_nauja.Rds")
+if(!(file.exists(outFile))) {
+path_to_mouse_annotation = "/mnt/store/annotations/MusMusculus_mm10_Ensembl/ENCODE/gencode.vM7.annotation.gtf"
+gtf <- rtracklayer::import(path_to_mouse_annotation)
+gtf <- as.data.table(gtf)
+kiek_genu <- gtf %>% filter(gene_type == "protein_coding") %>% count(type)
+
+anotacija <- gtf %>% filter(gene_type == "protein_coding") %>%
+  filter(type == "gene") %>% select(seqnames, strand, start, end, width, type) %>%
+  makeGRangesFromDataFrame(keep.extra.columns = TRUE)
+promotoriai <- promoters(anotacija, upstream=1000, downstream = 1000, use.names=TRUE) %>% 
+    as.data.table() %>% mutate(type = "promoter")  %>% select(seqnames, start, end, type)
+genai <- as.data.table(anotacija) %>% select(seqnames, start, end, type) 
+egzonai <- gtf %>% filter(gene_type == "protein_coding") %>%
+  filter(type == "exon") %>% select(seqnames, start, end, type) 
+dtanno <- readRDS("./input/data_annotation_final.RDS")
+dtanno <- dtanno %>% rename(chr = "seqnames")
+elementai <- c("intron", "UTR3", "UTR5", "intergenic")
+anno <- dtanno %>% filter(element %in% elementai) %>% select(-annotation) %>%
+  rename(element = "type")
+CGI <- dtanno %>% filter(grepl("CGI all", element)) %>% select(-annotation) %>%
+  rename(element = "type") %>% mutate(type = "CGI")
+
+anotacija <- rbind(genai, egzonai, promotoriai, anno, CGI)
+saveRDS(anotacija, outFile)
+}
+
+
+outFile <- paste0(outdatadir, "lentele_uCG_mCG_elementsNEW.Rds")
+anotacija <- readRDS(paste0(outdatadir, "anotacija_nauja.Rds"))
+elementai <- as.character(anotacija %>% count(type) %>% .$type)
+if(!(file.exists(outFile))) {
+dtBis <- fread(paste0("/mnt/store/DMTS/mESC_openChrom/regions/GSM1372647_markdup_CpG.bedGraph"), skip = 1) %>%
+         setnames(c("seqnames", "start", "end", "m_level", "mCG", "uCG")) ## Bis4
+dtBis$seqnames <- factor(dtBis$seqnames)
+dtBis <- dtBis %>% mutate(start = start+1 , end = start)
+dtuCG <- readRDS("./input/uCG.RDS") %>% as.data.table()
+anotacija$seqnames <- gsub("^chr", "", anotacija$seqnames)
+sets <- c(1:4)
+tmp1 <- dtuCG %>% select(seqnames, start, end, TT_S0_deep) %>%
+full_join(.,
+  dtBis, by = c("seqnames", "start", "end")) 
+tmp1[is.na(tmp1)] <- 0
+tmp1 <- tmp1 %>%  
+  makeGRangesFromDataFrame(keep.extra.columns = TRUE)
+lentele <- foreach(i = sets) %do% {
+  print(i)
+dt <- readRDS(file_names[i]) 
+tmp2 <- dt[[1]] %>% as.data.table() %>% filter(nCG > 5) %>% 
+  select(seqnames, start, end, width, strand, uCG_fraction, nCG) %>%
+  makeGRangesFromDataFrame(keep.extra.columns = TRUE) 
+ov <- findOverlaps(tmp2, tmp1) 
+tmp2_matched <- tmp2[queryHits(ov)]
+mcols(tmp2_matched) <- cbind.data.frame(
+    mcols(tmp2_matched),
+    mcols(tmp1[subjectHits(ov)]))
+  foreach(j = elementai) %do% {
+    anno <- anotacija %>% filter(type == j) %>% makeGRangesFromDataFrame()
+    good <- countOverlaps(tmp2_matched, anno)
+    tmp3 <- tmp2_matched[good > 0] 
+    tmp4 <- tmp3 %>% as.data.table() %>% regionbin() %>% group_by(regionID) %>%
+      summarise(
+        fractionmCG = sum(mCG) / sum(mCG + uCG),
+        fractionuCG = mean(uCG_fraction),
+        coverage = mean(TT_S0_deep),
+        nCG = sum(nCG)
+      ) %>% setnames(c("regionID",
+      paste0(i, "_", j, "_mCG"),
+      paste0(i, "_", j, "_uCG"),
+      paste0(i, "_", j, "_coverage"), 
+      paste0(i, "_", j, "_nCG"))
+      )
+  }
+}
+
+num_keep <- c(1:4)
+linked_sample <- foreach(i = num_keep) %do% {
+    Reduce(full_join, lentele[[i]])  %>%
+   pivot_longer(-regionID, names_to = c("rinkinys", "elementas", ".value"), 
+               names_sep= "_") 
+}
+full_dt <- Reduce(rbind, linked_sample)
+full_dt <- full_dt[complete.cases(full_dt),]
+saveRDS(full_dt, outFile)
+}
+
+full_dt <- readRDS(outFile)
+full_dt$rinkinys <- factor(full_dt$rinkinys, 
+levels = c("1", "2", "3", "4"), 
+labels = pavadinimai)
+full_dt$elementas <- factor(full_dt$elementas, 
+levels = elementai,
+labels = c("Genas", "Egzonas", "Promotorius", "Intergeninis", "Intronas", "UTR3", "UTR5", "CGI"))
+metodai <- pivot_longer(full_dt, cols = c("mCG", "uCG"), names_to = "metodas",
+  values_to = "frakcija")
+metodai <- metodai %>% filter(rinkinys == "lGC") %>% filter(elementas != "Intergeninis")
+gg1 <- ggplot(metodai, aes(y = frakcija, x = elementas, fill = metodas)) + 
+  geom_boxplot() + theme_bw() +
+  scale_fill_brewer(palette = "Dark2") +
+   #scale_y_continuous(limits =c(-0.1, 1.1)) + 
+  #facet_grid(rows = vars(rinkinys), cols = vars(elementas), scales = 'free_x') +
+  labs(
+    title = "a",
+    y = "Signalo įvertis",
+    x = "Genominis elementas",
+    fill = "Taikinys") +
+      theme(
+        strip.text.x = element_text(size = 16),
+        axis.text.x = element_text(size = 14, angle = 45, hjust = 1, vjust = 1, face = 'bold'),
+        axis.text.y = element_text(size = 14),
+        axis.title = element_text(size = 18),
+        title = element_text(size = 22),
+        legend.key.size = unit(1, 'cm'), 
+        legend.title = element_text(size= 18), 
+        legend.text = element_text(size=16))  #+ 
+ #stat_summary(fun.data = give.n, geom = "text", fun.y = median,
+  #               position = position_dodge(width = 0.75), 
+   #               angle = 90, size = 3, fontface = "bold")
+
+
+visi <- pivot_longer(full_dt, cols = c("mCG", "uCG"), names_to = "metodas",
+  values_to = "frakcija") %>% filter(elementas != "Intergeninis")
+p1 <- ggplot(visi, aes(y = frakcija, x = elementas, fill = metodas)) + 
+  geom_boxplot() + theme_bw() +
+  scale_fill_brewer(palette = "Dark2") +
+   #scale_y_continuous(limits =c(-0.1, 1.1)) + 
+   facet_grid(cols = vars(rinkinys), scales = 'free_x') +
+    theme(
+        strip.text.x = element_text(size = 16),
+        axis.text.x = element_text(size = 14, angle = 45, hjust = 1, vjust = 1, face = 'bold'),
+        axis.text.y = element_text(size = 14),
+        axis.title = element_text(size = 18),
+        title = element_text(size = 22),
+        legend.key.size = unit(1, 'cm'), 
+        legend.title = element_text(size= 18), 
+        legend.text = element_text(size=16)) + #+ 
+  labs(
+    title = "",
+    y = "Signalo įvertis",
+    x = "Genominis elementas",
+    fill = "Taikinys")  #+ 
+ #stat_summary(fun.data = give.n, geom = "text", fun.y = median,
+  #               position = position_dodge(width = 0.75), 
+   #               angle = 90, size = 3, fontface = "bold")
+
+
+ggsave(filename = "output/code/prepdata/paveikslai/bakalauras_bonus/3_3_WGBS_visi_rinkiniai_elementuose.png",
+                plot = p1, width = 420, height = 210, units = "mm")
+
+#outFile <- paste0(outdatadir, "metilinimas_frakcija_elementai.Rds")
+outFile <- paste0(outdatadir, "metilinimas_promotoriai_genaiNEW.Rds")
+if(!(file.exists(outFile))) {
+anotacija <- readRDS(paste0(outdatadir, "promotoriu_anotacija.Rds"))
+anotacija$seqnames <- gsub("^chr", "", anotacija$seqnames)
+elementai <- c("promoter", "gene", "other")
+dtBis <- fread(paste0("/mnt/store/DMTS/mESC_openChrom/regions/GSM1372647_markdup_CpG.bedGraph"), skip = 1) %>%
+         setnames(c("seqnames", "start", "end", "m_level", "mCG", "uCG")) ## Bis4
+dtBis$seqnames <- factor(dtBis$seqnames)
+dtBis <- dtBis %>% mutate(start = start+1 , end = start)
+sets <- c(1:4)
+dtuCG <- readRDS("./input/uCG.RDS") %>% as.data.table()
+tmp1 <- dtuCG %>% select(seqnames, start, end, TT_S0_deep) %>%
+full_join(.,
+  dtBis, by = c("seqnames", "start", "end")) 
+tmp1[is.na(tmp1)] <- 0
+tmp1 <- tmp1 %>%  
+  makeGRangesFromDataFrame(keep.extra.columns = TRUE)
+lentele <- foreach(i = sets) %do% {
+  print(i)
+dt <- readRDS(file_names[i]) 
+tmp2 <- dt[[1]] %>% as.data.table() %>% 
+  select(seqnames, start, end, width, strand, uCG_fraction, uCG, nCG) %>%
+   rename(uCG = "uCG_n") %>%
+  makeGRangesFromDataFrame(keep.extra.columns = TRUE) 
+ov <- findOverlaps(tmp2, tmp1) 
+tmp2_matched <- tmp2[queryHits(ov)]
+mcols(tmp2_matched) <- cbind.data.frame(
+    mcols(tmp2_matched),
+    mcols(tmp1[subjectHits(ov)]))
+foreach(j = elementai) %do% {
+    if (j == "promoter") {
+       print(j)
+tmp3 <- as.data.frame(anotacija) %>% filter(grepl("promotorius", type)) %>% makeGRangesFromDataFrame()
+ goodCG <- countOverlaps(tmp2_matched, tmp3)
+ final <- tmp2_matched[goodCG > 0]
+    } else if (j == "gene") {
+        print(j)
+tmp3 <- as.data.frame(anotacija) %>% filter(grepl("genas", type)) %>% makeGRangesFromDataFrame()
+ goodCG <- countOverlaps(tmp2_matched, tmp3) 
+  final <- tmp2_matched[goodCG > 0]
+    } else {
+        print(j)
+tmp3 <- as.data.frame(anotacija) %>% makeGRangesFromDataFrame()
+ goodCG <- countOverlaps(tmp2_matched, tmp3) 
+  final <- tmp2_matched[goodCG == 0]
+    }    
+tmp4 <- as.data.table(final) %>% regionbin() %>% 
+        group_by(regionID) %>% 
+        summarise(fractionuCG = mean(uCG_fraction),
+          fractionmCG = sum(mCG) / sum(mCG + uCG),
+          coveragemean = mean(TT_S0_deep),
+          uCGsk = mean(uCG_n),
+          nCG = mean(nCG)) %>%
+        setnames(c("regionID", paste0(i, "_", j, "_uCG"), paste0(i, "_", j, "_mCG"), 
+                               paste0(i, "_", j, "_coverage"),
+                               paste0(i, "_", j, "_uCGsk"), paste0(i, "_", j, "_nCG")))
+}}
+
+num_keep <- c(1:4)
+linked_sample <- foreach(i = num_keep) %do% {
+    Reduce(full_join, lentele[[i]])  %>%
+   pivot_longer(-regionID, names_to = c("rinkinys", "elementas", ".value"), 
+               names_sep= "_") 
+}
+full_dt <- Reduce(rbind, linked_sample)
+full_dt <- full_dt[complete.cases(full_dt),]
+full_dt <- full_dt %>% 
+  mutate(regionas = cut(uCG, 
+  breaks=c(0, 0.2, 0.4, 0.6, 0.8, max(uCG)), include.lowest=TRUE)) 
+saveRDS(full_dt, outFile)
+}
+
+
+full_dt <- readRDS(outFile)
+full_dt$rinkinys <- factor(full_dt$rinkinys, 
+  levels = c("1", "2", "3", "4"), 
+  labels = pavadinimai)
+count_dt <- full_dt %>% filter(rinkinys == "lGC") %>% 
+  pivot_longer(cols = c("uCGsk", "nCG"), names_to = "taikinys", values_to = "skaicius")
+
+tmp1 <- full_dt %>% filter(rinkinys == 'lGC', elementas == 'promoter', nCG > 5) 
+
+data.table(
+          "estimate" = cor.test(tmp1$mCG, tmp1$uCG, method = "spearman")$estimate,
+          "pvalue" = cor.test(tmp1$mCG, tmp1$uCG, method = "spearman")$p.value)
+
+data.table(
+          "estimate" = cor.test(tmp1$mCG, tmp1$coverage, method = "spearman")$estimate,
+          "pvalue" = cor.test(tmp1$mCG, tmp1$coverage, method = "spearman")$p.value)
+
+
+#### uCG frakcijos ir coverage pasiskirstymas skirtinguose regionuose
+#full_dt <- full_dt %>% filter(coverage < 39)
+full_dt <- full_dt %>% 
+  mutate(coverage_int = cut(coverage, 
+  breaks=c(0, 0.5, 1, 1.5, 2, 2.5, max(coverage)), include.lowest=TRUE))
+full_dt <- full_dt %>% 
+  mutate(uCG = cut(uCG, 
+  breaks=c(0, 0.2, 0.4, 0.6, 0.8, max(uCG)), include.lowest=TRUE)) 
+full_dt$elementas <- factor(full_dt$elementas, 
+  levels = c("promoter", "gene", "other"),
+  labels = c("Promotorius", "Genas", "Intergeninis"))
+set_dt <- full_dt %>% filter(rinkinys == "lGC") %>% filter(nCG > 5)
+set_dt0 <- full_dt %>% filter(rinkinys %in% c("lGC", "lGCCG")) %>% filter(nCG > 5)
+
+p1 <- ggplot(set_dt, aes(y = mCG, x = uCG, fill = elementas)) + 
+  geom_boxplot() + theme_bw() +
+  scale_fill_brewer(palette = "Dark2") +
+   #scale_y_continuous(limits =c(-0.1, 1.1)) + 
+  #facet_grid(rows = vars(rinkinys), cols = vars(elementas), scales = 'free_x') +
+    theme(axis.text.x = element_text(vjust=0.6, angle=90, face = "bold")) +
+  labs(
+    title = "b",
+    y = "Vidutinis metilinimas regione",
+    x = "uCG frakcijos intervalas",
+    fill = "Elementas") + 
+      theme(
+        strip.text.x = element_text(size = 16),
+        axis.text.x = element_text(size = 14, hjust = 1, vjust = 1, face = 'bold'),
+        axis.text.y = element_text(size = 14),
+        axis.title = element_text(size = 14),
+        title = element_text(size = 22),
+        legend.key.size = unit(1, 'cm'), 
+        legend.title = element_text(size= 18), 
+        legend.text = element_text(size=16)) 
+
+
+skaidrei <- ggplot(set_dt0, aes(y = mCG, x = uCG, fill = elementas)) + 
+  geom_boxplot() + theme_bw() +
+  scale_fill_brewer(palette = "Dark2") +
+   #scale_y_continuous(limits =c(-0.1, 1.1)) + 
+   facet_grid(rows = vars(rinkinys)) +
+    theme(axis.text.x = element_text(vjust=0.6, angle=90, face = "bold")) +
+  labs(
+    title = "",
+    y = "Vidutinis metilinimas regione (WGBS)",
+    x = "uCG frakcijos intervalas (TOP-Seq)",
+    fill = "Elementas") + 
+      theme(
+        strip.text.y = element_text(size = 20),
+        axis.text.x = element_text(size = 18, hjust = 1, vjust = 1, face = 'bold'),
+        axis.text.y = element_text(size = 18),
+        axis.title = element_text(size = 18),
+        title = element_text(size = 22),
+        legend.key.size = unit(1, 'cm'), 
+        legend.title = element_text(size= 18), 
+        legend.text = element_text(size=16),
+        legend.position = 'top') 
+ggsave(filename = "output/code/prepdata/paveikslai/bakalauras_bonus/paveiksliukas_skaidrei.png",
+                plot = skaidrei, width = 420, height = 210, units = "mm")
+#my_comparisons <- list( c("[0,0.2]", "(0.2,0.4]"), 
+#                        c("(0.2,0.4]", "(0.4,0.6]"),
+#                        c("(0.4,0.6]", "(0.6,0.8]"),
+#                        c("(0.6,0.8]", "(0.8,1]"))
+#skaidrei <- skaidrei + stat_compare_means(method = "wilcox.test", label = "p.signif", comparisons = my_comparisons)
+
+p2 <- ggplot(set_dt, aes(y = mCG, x = coverage_int, fill = elementas)) + 
+  geom_boxplot() + theme_bw() +
+  scale_fill_brewer(palette = "Dark2") +
+   #scale_y_continuous(limits =c(-0.1, 1.1)) + 
+  #facet_grid(rows = vars(rinkinys), cols = vars(elementas), scales = 'free_x') +
+    theme(axis.text.x = element_text(vjust=0.6, angle=90, face = "bold")) +
+  labs(
+    y = "Vidutinis metilinimas regione",
+    x = "Vidutinio uCG padengimo intervalas",
+    fill = "Elementas") + 
+          theme(
+        strip.text.x = element_text(size = 16),
+        axis.text.x = element_text(size = 14, hjust = 1, vjust = 1, face = 'bold'),
+        axis.text.y = element_text(size = 14),
+        axis.title = element_text(size = 16),
+        title = element_text(size = 22),
+        legend.key.size = unit(1, 'cm'), 
+        legend.title = element_text(size= 18), 
+        legend.text = element_text(size=16)) 
+
+gg2 <- ggarrange(p1, p2, common.legend = TRUE, nrow = 2)
+
+gg3 <- ggplot(set_dt, aes(x = elementas, y = coverage)) + 
+ geom_boxplot(fill = "#7570b3") + scale_fill_brewer(palette = "Dark2") +
+ theme_bw() + scale_y_continuous(trans = 'log10') + labs(
+  title = "c",
+  x = "Elementas", 
+  y = "Vidutinis regiono padengimas"
+ ) +  theme(
+        strip.text.x = element_text(size = 16),
+        axis.text.x = element_text(size = 14, face = 'bold'),
+        axis.text.y = element_text(size = 14),
+        axis.title = element_text(size = 18),
+        title = element_text(size = 22),
+        legend.key.size = unit(1, 'cm'), 
+        legend.title = element_text(size= 18), 
+        legend.text = element_text(size=16)) 
+
+
+my_comparisons <- list( c("Genas", "Promotorius"), 
+                        c("Promotorius", "Intergeninis"),
+                        c("Genas", "Intergeninis"))
+gg3 <- gg3 + stat_compare_means(method = "wilcox.test", label = "p.signif", comparisons = my_comparisons)
+
+p0 <- ((gg1 / gg3) | gg2)
+
+p0
+p0 <- ggarrange(p0)
+ggsave(filename = "output/code/prepdata/paveikslai/bakalauras/3_3_WGBS_metilinimas_elementuose.png",
+                plot = p0, width = 420, height = 210, units = "mm")
+```
+
+# 3.4 hmC signalas
+
+```{r}
+### Koreliacijos 
+outFile <- paste0(outdatadir, "lentele_hmC_mCG_cor_coverage.Rds")
+if(!(file.exists(outFile))) {
+dtBis <- fread(paste0("/mnt/store/DMTS/mESC_openChrom/regions/GSM1372647_markdup_CpG.bedGraph"), skip = 1) %>%
+         setnames(c("seqnames", "start", "end", "m_level", "mCG", "uCG")) ## Bis4
+dtBis$seqnames <- factor(dtBis$seqnames)
+dtBis <- dtBis %>% mutate(start = start+1 , end = start)
+###
+sets <- c(1:4)
+min <- c(0, 5, 10, 15, 20, 25, 30, 35, 40)
+dtuCG <- readRDS("./input/hmC.RDS") %>% as.data.table()
+sets <- c(1:4)
+tmp1 <- dtuCG %>% select(seqnames, start, end, TT_S0_deep) %>%
+full_join(.,
+  dtBis, by = c("seqnames", "start", "end")) 
+tmp1[is.na(tmp1)] <- 0
+tmp1 <- tmp1 %>%  
+  makeGRangesFromDataFrame(keep.extra.columns = TRUE)
+lentele <- foreach(i = sets) %do% {
+  print(i)
+dt <- readRDS(file_names[i]) 
+tmp2 <- dt[[1]] %>% as.data.table() %>% 
+  select(seqnames, start, end, width, strand, uCG, group_poster, nCG, hmC, width, hmC_fraction) %>%
+  rename(uCG = "uCG_n") %>%
+  makeGRangesFromDataFrame(keep.extra.columns = TRUE) 
+ov <- findOverlaps(tmp2, tmp1) 
+tmp2_matched <- tmp2[queryHits(ov)]
+mcols(tmp2_matched) <- cbind.data.frame(
+    mcols(tmp2_matched),
+    mcols(tmp1[subjectHits(ov)]))
+tmp3 <- as.data.table(tmp2_matched) %>% regionbin() %>%
+        group_by(regionID, group_poster) %>%  summarise(
+          mCG = sum(mCG) / sum(mCG + uCG),
+          hmC = mean(hmC_fraction),
+          nCG = mean(nCG),
+          width = mean(width),
+          coverage = mean(TT_S0_deep)) %>%
+      setnames(c("regionID", "group_poster", 
+                  paste0(i, "_mCG"), paste0(i, "_hmC"),
+                  paste0(i, "_nCG"), paste0(i, "_width"), 
+                  paste0(i, "_coverage"))) 
+}
+
+full_dt <- Reduce(full_join, lentele) %>%
+ pivot_longer(cols = -c("regionID", "group_poster"), 
+ names_to = c("rinkinys", ".value"), names_sep = "_")
+full_dt <- full_dt[complete.cases(full_dt),]
+saveRDS(full_dt, outFile)
+}
+
+
+outFile <- paste0(outdatadir, "cor_hmC_fraction.Rds")
+rinkiniai <- c(1:4)
+minimum <-c(0, 5, 10, 15, 20, 30, 40)
+if(!(file.exists(outFile))) {
+        full_dt <- readRDS(paste0(outdatadir, "lentele_hmC_mCG_cor_coverage.Rds"))
+lentele <-  foreach(j = rinkiniai) %do% {
+      foreach(z = minimum) %do% {
+        tmp1 <- full_dt %>% ungroup() %>% filter(rinkinys == j & nCG > z) 
+        value <- data.table(
+          "estimate" = cor.test(tmp1$mCG, tmp1$hmC, method = "spearman")$estimate,
+          "pvalue" = cor.test(tmp1$mCG, tmp1$hmC, method = "spearman")$p.value) %>% 
+          setnames(c(paste0(j, "_", z, "_estimate"), paste0(j, "_", z,"_pvalue")))
+      }
+    }
+num_keep <- 1:4
+linked_sample <- foreach(i = num_keep) %do% {
+Reduce(cbind, lentele[[i]])  %>%
+   pivot_longer(cols = everything(), names_to = c("rinkinys", "minimum", ".value"), 
+               names_sep= "_") 
+}
+
+full_dt <- Reduce(rbind, linked_sample)
+full_dt <- full_dt[complete.cases(full_dt),]
+saveRDS(full_dt, outFile)
+}
+
+dt11 <- readRDS(outFile) %>% mutate(taikinys = "mCG", statistika = "fraction")
+
+outFile <- paste0(outdatadir, "cor_hmC_coverage.Rds")
+rinkiniai <- c(1:4)
+minimum <-c(0, 5, 10, 15, 20, 30, 40)
+if(!(file.exists(outFile))) {
+        full_dt <- readRDS(paste0(outdatadir, "lentele_hmC_mCG_cor_coverage.Rds"))
+lentele <-  foreach(j = rinkiniai) %do% {
+          print(j)
+      foreach(z = minimum) %do% {
+          print(z)
+        tmp1 <- full_dt %>% ungroup() %>% filter(rinkinys == j & nCG > z) 
+        value <- data.table(
+          "estimate" = cor.test(tmp1$mCG, tmp1$coverage, method = "spearman")$estimate,
+          "pvalue" = cor.test(tmp1$mCG, tmp1$coverage, method = "spearman")$p.value) %>% 
+          setnames(c(paste0(j, "_", z, "_estimate"), paste0(j, "_", z,"_pvalue")))
+      }
+    }
+num_keep <- 1:4
+linked_sample <- foreach(i = num_keep) %do% {
+Reduce(cbind, lentele[[i]])  %>%
+   pivot_longer(cols = everything(), names_to = c("rinkinys", "minimum", ".value"), 
+               names_sep= "_") 
+}
+
+full_dt <- Reduce(rbind, linked_sample)
+full_dt <- full_dt[complete.cases(full_dt),]
+saveRDS(full_dt, outFile)
+}
+
+dt12 <- readRDS(outFile) %>% mutate(taikinys = "mCG", statistika = "coverage")
+
+
+outFile <- paste0(outdatadir, "hmC_uCG_cor.Rds")
+if(!(file.exists(outFile))) {
+dt_hmC <- readRDS("./input/hmC.RDS") %>% as.data.table() %>% select(seqnames,
+start, end, TT_S0_deep) %>% rename(TT_S0_deep = "coveragehmC")
+dtuCG <- readRDS("./input/uCG.RDS") %>% as.data.table() %>% full_join(.,
+  dt_hmC, by = c("seqnames", "start", "end")) %>% 
+  select(seqnames, start, end, TT_S0_deep, coveragehmC)
+dtuCG[is.na(dtuCG)] <- 0
+tmp1 <- dtuCG %>%  
+  makeGRangesFromDataFrame(keep.extra.columns = TRUE)
+lentele <- foreach(i = sets) %do% {
+  print(i)
+dt <- readRDS(file_names[i]) 
+tmp2 <- dt[[1]] %>% as.data.table() %>% 
+  select(seqnames, start, end, width, strand, uCG, group_poster, nCG, hmC_fraction, uCG_fraction) %>%
+  makeGRangesFromDataFrame(keep.extra.columns = TRUE) 
+ov <- findOverlaps(tmp2, tmp1) 
+tmp2_matched <- tmp2[queryHits(ov)]
+mcols(tmp2_matched) <- cbind.data.frame(
+    mcols(tmp2_matched),
+    mcols(tmp1[subjectHits(ov)]))
+tmp3 <- as.data.table(tmp2_matched) %>% regionbin() %>%
+        group_by(regionID, group_poster) %>%  summarise(
+          hmC = mean(hmC_fraction),
+          uCG = mean(uCG_fraction),
+          coverage_hmC = mean(coveragehmC), 
+          coverage_uCG = mean(TT_S0_deep),
+          nCG = mean(nCG)) %>%
+      setnames(c("regionID", "group_poster", 
+                  paste0(i, "_hmC"), paste0(i, "_uCG"),
+                  paste0(i, "_coveragehmC"), paste0(i, "_coverageuCG"),
+                  paste0(i, "_nCG"))) 
+}
+
+full_dt <- Reduce(full_join, lentele) %>%
+ pivot_longer(cols = -c("regionID", "group_poster"), 
+ names_to = c("rinkinys", ".value"), names_sep = "_")
+full_dt <- full_dt[complete.cases(full_dt),]
+saveRDS(full_dt, outFile)
+}
+
+
+
+outFile <- paste0(outdatadir, "cor_uCG_hmC_fraction.Rds")
+rinkiniai <- c(1:4)
+minimum <-c(0, 5, 10, 15, 20, 30, 40)
+if(!(file.exists(outFile))) {
+        full_dt <- readRDS(paste0(outdatadir, "hmC_uCG_cor.Rds"))
+lentele <-  foreach(j = rinkiniai) %do% {
+      foreach(z = minimum) %do% {
+        tmp1 <- full_dt %>% ungroup() %>% filter(rinkinys == j & nCG > z) 
+        value <- data.table(
+          "estimate" = cor.test(tmp1$uCG, tmp1$hmC, method = "spearman")$estimate,
+          "pvalue" = cor.test(tmp1$uCG, tmp1$hmC, method = "spearman")$p.value) %>% 
+          setnames(c(paste0(j, "_", z, "_estimate"), paste0(j, "_", z,"_pvalue")))
+      }
+    }
+num_keep <- 1:4
+linked_sample <- foreach(i = num_keep) %do% {
+Reduce(cbind, lentele[[i]])  %>%
+   pivot_longer(cols = everything(), names_to = c("rinkinys", "minimum", ".value"), 
+               names_sep= "_") 
+}
+
+full_dt <- Reduce(rbind, linked_sample)
+full_dt <- full_dt[complete.cases(full_dt),]
+saveRDS(full_dt, outFile)
+}
+
+dt21 <- readRDS(outFile) %>% mutate(taikinys = "uCG", statistika = "fraction")
+
+outFile <- paste0(outdatadir, "cor_uCG_hmC_coverage.Rds")
+rinkiniai <- c(1:4)
+minimum <-c(0, 5, 10, 15, 20, 30, 40)
+if(!(file.exists(outFile))) {
+        full_dt <- readRDS(paste0(outdatadir, "hmC_uCG_cor.Rds"))
+lentele <-  foreach(j = rinkiniai) %do% {
+      foreach(z = minimum) %do% {
+        tmp1 <- full_dt %>% ungroup() %>% filter(rinkinys == j & nCG > z) 
+        value <- data.table(
+          "estimate" = cor.test(tmp1$coverageuCG, tmp1$coveragehmC, method = "spearman")$estimate,
+          "pvalue" = cor.test(tmp1$coverageuCG, tmp1$coveragehmC, method = "spearman")$p.value) %>% 
+          setnames(c(paste0(j, "_", z, "_estimate"), paste0(j, "_", z,"_pvalue")))
+      }
+    }
+num_keep <- 1:4
+linked_sample <- foreach(i = num_keep) %do% {
+Reduce(cbind, lentele[[i]])  %>%
+   pivot_longer(cols = everything(), names_to = c("rinkinys", "minimum", ".value"), 
+               names_sep= "_") 
+}
+
+full_dt <- Reduce(rbind, linked_sample)
+full_dt <- full_dt[complete.cases(full_dt),]
+saveRDS(full_dt, outFile)
+}
+
+dt22 <- readRDS(outFile) %>% mutate(taikinys = "uCG", statistika = "coverage")
+
+full_dt <- rbind(dt11, dt12, dt21, dt22)
+
+full_dt$rinkinys <- factor(full_dt$rinkinys, 
+  levels = c("1", "2", "3", "4"), 
+  labels = pavadinimai)
+full_dt$minimum <- factor(full_dt$minimum, 
+  levels = minimum)
+full_dt$statistika <- factor(full_dt$statistika, 
+  levels = c("fraction", "coverage"),
+  labels = c("Signalo tipas =\nFrakcija", "Signalo tipas =\nPadengimas"))
+full_dt <- full_dt %>% filter(rinkinys == "lGC")
+gg1 <- ggplot(full_dt, aes(x = minimum, y = estimate, fill = taikinys)) +
+  geom_col(position = 'dodge', color = 'black') + theme_bw() + 
+  scale_fill_brewer(palette = 'Dark2') +
+  facet_grid(cols = vars(statistika)) + labs(
+    x = "Minimali filtravimo vertė",
+    y = "Spearman koreliacijos įvertis",
+    fill = "Taikiys su kuriuo\nlyginta"
+  ) + theme(
+        strip.text.x = element_text(size = 16),
+        axis.text.x = element_text(size = 16, face = 'bold'),
+        axis.text.y = element_text(size = 14),
+        axis.title = element_text(size = 18),
+        title = element_text(size = 22),
+        legend.key.size = unit(1, 'cm'), 
+        legend.title = element_text(size= 18), 
+        legend.text = element_text(size=16)) 
+
+
+ggsave(filename = "output/code/prepdata/paveikslai/bakalauras_bonus/3_1_WGBS_hmC_koreliacijos.png",
+                plot = gg1, width = 420, height = 210, units = "mm")
+
+
+##### ELEMENTAI
+outFile <- paste0(outdatadir, "lentele_hmC_mCG_elements.Rds")
+if(!(file.exists(outFile))) {
+anotacija <- readRDS(paste0(outdatadir, "anotacija_nauja.Rds"))
+elementai <- as.character(anotacija %>% count(type) %>% .$type)
+dtBis <- fread(paste0("/mnt/store/DMTS/mESC_openChrom/regions/GSM1372647_markdup_CpG.bedGraph"), skip = 1) %>%
+         setnames(c("seqnames", "start", "end", "m_level", "mCG", "uCG")) ## Bis4
+dtBis$seqnames <- factor(dtBis$seqnames)
+dtBis <- dtBis %>% mutate(start = start+1 , end = start)
+dtuCG <- readRDS("./input/hmC.RDS") %>% as.data.table()
+anotacija$seqnames <- gsub("^chr", "", anotacija$seqnames)
+sets <- c(1:4)
+tmp1 <- dtuCG %>% select(seqnames, start, end, TT_S0_deep) %>%
+full_join(.,
+  dtBis, by = c("seqnames", "start", "end")) 
+tmp1[is.na(tmp1)] <- 0
+tmp1 <- tmp1 %>%  
+  makeGRangesFromDataFrame(keep.extra.columns = TRUE)
+lentele <- foreach(i = sets) %do% {
+  print(i)
+dt <- readRDS(file_names[i]) 
+tmp2 <- dt[[1]] %>% as.data.table() %>% filter(nCG > 5) %>% 
+  select(seqnames, start, end, width, strand, hmC_fraction, nCG) %>%
+  makeGRangesFromDataFrame(keep.extra.columns = TRUE) 
+ov <- findOverlaps(tmp2, tmp1) 
+tmp2_matched <- tmp2[queryHits(ov)]
+mcols(tmp2_matched) <- cbind.data.frame(
+    mcols(tmp2_matched),
+    mcols(tmp1[subjectHits(ov)]))
+  foreach(j = elementai) %do% {
+    anno <- anotacija %>% filter(type == j) %>% makeGRangesFromDataFrame()
+    good <- countOverlaps(tmp2_matched, anno)
+    tmp3 <- tmp2_matched[good > 0] 
+    tmp4 <- tmp3 %>% as.data.table() %>% regionbin() %>% group_by(regionID) %>%
+      summarise(
+        fractionmCG = sum(mCG) / sum(mCG + uCG),
+        fractionhmC = mean(hmC_fraction),
+        coverage = mean(TT_S0_deep),
+        nCG = sum(nCG)
+      ) %>% setnames(c("regionID",
+      paste0(i, "_", j, "_mCG"),
+      paste0(i, "_", j, "_hmC"),
+      paste0(i, "_", j, "_coverage"), 
+      paste0(i, "_", j, "_nCG"))
+      )
+  }
+}
+
+num_keep <- c(1:4)
+linked_sample <- foreach(i = num_keep) %do% {
+    Reduce(full_join, lentele[[i]])  %>%
+   pivot_longer(-regionID, names_to = c("rinkinys", "elementas", ".value"), 
+               names_sep= "_") 
+}
+full_dt <- Reduce(rbind, linked_sample)
+full_dt <- full_dt[complete.cases(full_dt),]
+saveRDS(full_dt, outFile)
+}
+
+full_dt <- readRDS(outFile)
+full_dt$rinkinys <- factor(full_dt$rinkinys, 
+levels = c("1", "2", "3", "4"), 
+labels = pavadinimai)
+full_dt$elementas <- factor(full_dt$elementas, 
+levels = elementai,
+labels = c("Genas", "Egzonas", "Promotorius", "Intergeninis", "Intronas", "UTR3", "UTR5", "CGI"))
+metodai <- pivot_longer(full_dt, cols = c("mCG", "hmC"), names_to = "metodas",
+  values_to = "frakcija")
+metodai <- metodai %>% filter(rinkinys == "lGC") %>% filter(elementas != "Intergeninis")
+
+gg1 <- ggplot(metodai, aes(y = frakcija, x = elementas, fill = metodas)) + 
+  geom_boxplot() + theme_bw() +
+  scale_fill_brewer(palette = "Dark2") +
+   theme(
+        strip.text.x = element_text(size = 16),
+        axis.text.x = element_text(size = 14, angle = 45, hjust = 1, vjust = 1, face = 'bold'),
+        axis.text.y = element_text(size = 14),
+        axis.title = element_text(size = 18),
+        title = element_text(size = 22),
+        legend.key.size = unit(1, 'cm'), 
+        legend.title = element_text(size= 18), 
+        legend.text = element_text(size=16)) + 
+  labs(
+    title = 'a',
+    y = "Signalo įvertis",
+    x = "Genominis elementas",
+    fill = "Taikinys") #+ 
+ #stat_summary(fun.data = give.n, geom = "text", fun.y = median,
+  #               position = position_dodge(width = 0.75), 
+   #               angle = 90, size = 3, fontface = "bold")
+
+
+#outFile <- paste0(outdatadir, "metilinimas_frakcija_elementai.Rds")
+outFile <- paste0(outdatadir, "metilinimas_hmC_frakcija_elementaiBis4NEW.Rds")
+if(!(file.exists(outFile))) {
+anotacija <- readRDS(paste0(outdatadir, "promotoriu_anotacija.Rds"))
+dtBis <- fread(paste0("/mnt/store/DMTS/mESC_openChrom/regions/GSM1372647_markdup_CpG.bedGraph"), skip = 1) %>%
+         setnames(c("seqnames", "start", "end", "m_level", "mCG", "uCG")) ## Bis4
+dtBis$seqnames <- factor(dtBis$seqnames)
+dtBis <- dtBis %>% mutate(start = start+1 , end = start)
+anotacija$seqnames <- gsub("^chr", "", anotacija$seqnames)
+elementai <- c("promoter", "gene", "other")
+sets <- c(1:4)
+dtuCG <- readRDS("./input/hmC.RDS") %>% as.data.table()
+tmp1 <- dtuCG %>% select(seqnames, start, end, TT_S0_deep) %>%
+full_join(.,
+  dtBis, by = c("seqnames", "start", "end")) 
+tmp1[is.na(tmp1)] <- 0
+tmp1 <- tmp1 %>%  
+  makeGRangesFromDataFrame(keep.extra.columns = TRUE)
+lentele <- foreach(i = sets) %do% {
+  print(i)
+dt <- readRDS(file_names[i]) 
+tmp2 <- dt[[1]] %>% as.data.table() %>% 
+  select(seqnames, start, end, width, strand, hmC_fraction, hmC, nCG) %>%
+  makeGRangesFromDataFrame(keep.extra.columns = TRUE) 
+ov <- findOverlaps(tmp2, tmp1) 
+tmp2_matched <- tmp2[queryHits(ov)]
+mcols(tmp2_matched) <- cbind.data.frame(
+    mcols(tmp2_matched),
+    mcols(tmp1[subjectHits(ov)]))
+foreach(j = elementai) %do% {
+    if (j == "promoter") {
+       print(j)
+tmp3 <- as.data.frame(anotacija) %>% filter(grepl("promotorius", type)) %>% makeGRangesFromDataFrame()
+ goodCG <- countOverlaps(tmp2_matched, tmp3)
+ final <- tmp2_matched[goodCG > 0]
+    } else if (j == "gene") {
+        print(j)
+tmp3 <- as.data.frame(anotacija) %>% filter(grepl("genas", type)) %>% makeGRangesFromDataFrame()
+ goodCG <- countOverlaps(tmp2_matched, tmp3) 
+  final <- tmp2_matched[goodCG > 0]
+    } else {
+        print(j)
+tmp3 <- as.data.frame(anotacija) %>% makeGRangesFromDataFrame()
+ goodCG <- countOverlaps(tmp2_matched, tmp3) 
+  final <- tmp2_matched[goodCG == 0]
+    }    
+tmp4 <- as.data.table(final) %>% regionbin() %>% 
+        group_by(regionID) %>% 
+        summarise(fractionhmC = mean(hmC_fraction),
+          fractionmCG = sum(mCG) / sum(mCG + uCG),
+          coveragemean = mean(TT_S0_deep),
+          hmCsk = mean(hmC),
+          nCG = mean(nCG)) %>%
+        setnames(c("regionID", paste0(i, "_", j, "_hmC"), paste0(i, "_", j, "_mCG"), 
+                               paste0(i, "_", j, "_coverage"),
+                               paste0(i, "_", j, "_hmCsk"), paste0(i, "_", j, "_nCG")))
+}}
+
+num_keep <- c(1:4)
+linked_sample <- foreach(i = num_keep) %do% {
+    Reduce(full_join, lentele[[i]])  %>%
+   pivot_longer(-regionID, names_to = c("rinkinys", "elementas", ".value"), 
+               names_sep= "_") 
+}
+full_dt <- Reduce(rbind, linked_sample)
+full_dt <- full_dt[complete.cases(full_dt),]
+saveRDS(full_dt, outFile)
+}
+
+
+full_dt <- readRDS(outFile)
+full_dt$rinkinys <- factor(full_dt$rinkinys, 
+  levels = c("1", "2", "3", "4"), 
+  labels = pavadinimai)
+
+
+#### uCG frakcijos ir coverage pasiskirstymas skirtinguose regionuose
+full_dt <- full_dt %>% 
+  mutate(coverage_int = cut(coverage, 
+  breaks=c(0, 0.5, 1, 1.5, 2, 2.5, max(coverage)), include.lowest=TRUE))
+full_dt <- full_dt %>% 
+  mutate(hmC = cut(hmC, 
+  breaks=c(0, 0.2, 0.4, 0.6, 0.8, max(hmC)), include.lowest=TRUE)) 
+full_dt$elementas <- factor(full_dt$elementas, 
+  levels = c("promoter", "gene", "other"),
+  labels = c("Promotorius", "Genas", "Intergeninis"))
+set_dt <- full_dt %>% filter(rinkinys == "lGC") %>% filter(nCG > 5)
+
+
+
+p1 <- ggplot(set_dt, aes(y = mCG, x = hmC, fill = elementas)) + 
+  geom_boxplot() + theme_bw() +
+  scale_fill_brewer(palette = "Dark2") +
+   #scale_y_continuous(limits =c(-0.1, 1.1)) + 
+  #facet_grid(rows = vars(rinkinys), cols = vars(elementas), scales = 'free_x') +
+    theme(axis.text.x = element_text(vjust=0.6, angle=90, face = "bold")) +
+  labs(
+    title = 'b',
+    y = "Vidutinis metilinimas regione",
+    x = "hmCG frakcijos intervalas",
+    fill = "Rinkinys") + theme(
+        strip.text.x = element_text(size = 16),
+        axis.text.x = element_text(size = 14, hjust = 1, vjust = 1, face = 'bold'),
+        axis.text.y = element_text(size = 14),
+        axis.title = element_text(size = 14),
+        title = element_text(size = 22),
+        legend.key.size = unit(1, 'cm'), 
+        legend.title = element_text(size= 18), 
+        legend.text = element_text(size=16)) 
+p2 <- ggplot(set_dt, aes(y = mCG, x = coverage_int, fill = elementas)) + 
+  geom_boxplot() + theme_bw() +
+  scale_fill_brewer(palette = "Dark2") +
+   #scale_y_continuous(limits =c(-0.1, 1.1)) + 
+  #facet_grid(rows = vars(rinkinys), cols = vars(elementas), scales = 'free_x') +
+    theme(axis.text.x = element_text(vjust=0.6, angle=90, face = "bold")) +
+  labs(
+    title = "",
+    y = "Vidutinis metilinimas regione",
+    x = "Vidutinio hmCG padengimo intervalas",
+    fill = "Rinkinys") + theme(
+        strip.text.x = element_text(size = 16),
+        axis.text.x = element_text(size = 14, hjust = 1, vjust = 1, face = 'bold'),
+        axis.text.y = element_text(size = 14),
+        axis.title = element_text(size = 16),
+        title = element_text(size = 22),
+        legend.key.size = unit(1, 'cm'), 
+        legend.title = element_text(size= 18), 
+        legend.text = element_text(size=16)) 
+
+gg2 <- ggarrange(p1, p2, common.legend = TRUE, nrow = 2)
+
+gg3 <- ggplot(set_dt, aes(x = elementas, y = coverage)) + 
+ geom_boxplot(fill = "#7570b3") + scale_fill_brewer(palette = "Dark2") +
+ theme_bw() + scale_y_continuous(trans = 'log10') + labs(
+  tilte = "c",
+  x = "Elementas", 
+  y = "Vidutinis regiono padengimas"
+ ) 
+
+
+my_comparisons <- list( c("Genas", "Promotorius"), 
+                        c("Promotorius", "Intergeninis"),
+                        c("Genas", "Intergeninis"))
+gg3 <- gg3 + stat_compare_means(method = "wilcox.test", label = "p.signif", comparisons = my_comparisons) + theme(
+        strip.text.x = element_text(size = 16),
+        axis.text.x = element_text(size = 14, face = 'bold'),
+        axis.text.y = element_text(size = 14),
+        axis.title = element_text(size = 18),
+        title = element_text(size = 22),
+        legend.key.size = unit(1, 'cm'), 
+        legend.title = element_text(size= 18), 
+        legend.text = element_text(size=16)) 
+
+
+p0 <- ((gg1 / gg3) | gg2)
+
+p0
+p0 <- ggarrange(p0)
+ggsave(filename = "output/code/prepdata/paveikslai/bakalauras_bonus/3_2_WGBS_hmC_elementuose.png",
+                plot = p0, width = 420, height = 210, units = "mm")
+
+
+
+```
