@@ -1,0 +1,454 @@
+```{r}
+library(pacman)
+p_load(data.table, dplyr, ggplot2, foreach, 
+GenomicRanges, yaml, purrr, fs, stringr, tximport, edgeR, tidyr, ggseqlogo, corrplot,
+factoextra, ggstatsplot, tidyverse, ggpubr, GEOquery, rtracklayer, gridExtra, 
+rstatix, ggprism, rtracklayer, knitr, patchwork, ggcorrplot, Rsamtools, tidytext)
+outdatadir <- "output/code/prepdata/"
+grafikai <- "output/code/prepdata/grafikai/"
+options(scipen=999)
+knitr::opts_chunk$set(echo = TRUE, fig.width = 20, fig.height = 12)
+
+
+# Funkcijos 
+bin <- function(dt, bins = 500) {
+    dt <- dt %>% mutate(binID = paste0(seqnames,"_", floor(start/bins)))
+    return(dt)
+}
+
+regionbin <- function(dt) {
+  dt[, regionID := paste0(seqnames, "_", start,"_", end)]
+  return(dt)
+}
+
+give.n <- function(x){
+  return(c(y = median(x)*1.10, label = length(x))) }
+
+# Failai
+file_names <- fs::dir_ls("/mnt/store/DMTS/mESC_openChrom/regions/", regexp = "Final")
+#dtuCG <- readRDS("/mnt/store/DMTS/mESC_openChrom/regions/Cov_data_triple.RDS")
+#total <- dtuCG$total
+#saveRDS(total, "./input/total.RDS")
+#total <- total %>% as.data.table() %>% setnames("TT_S0", "TT_S0_deep") 
+pavadinimai <- c("lGC", "lGCCG", "gGC", "gGCCG")
+```
+
+```{r}
+sets <- c(1:4)
+lentele <- foreach(i = sets) %do% {
+  print(i)
+dt <- readRDS(file_names[i]) 
+dt[[1]] %>% as.data.table() %>% mutate(rinkinys = paste0(i))
+}
+
+full_dt <- Reduce(rbind, lentele) 
+full_dt$rinkinys <- factor(full_dt$rinkinys, 
+  levels = c("1", "2", "3", "4"), 
+  labels = pavadinimai)
+full_dt$group_poster <- factor(full_dt$group_poster, 
+  levels = c("hmC+", "uCG+", "uCG+_hmC+", "uCG-_hmC-", "GC_only"),
+  labels = c("hmCG+", "uCG+", "uCG+hmCG+", "uCG-hmCG-", "GC+"))
+count_dt <- full_dt %>% count(rinkinys, group_poster)
+
+
+#count_dt <- count_dt %>% filter(rinkinys == 'lGC')
+gg1 <- ggplot(count_dt, aes(x = rinkinys, y = n, fill = group_poster)) + 
+  geom_col(position = 'dodge', color = 'black') + scale_fill_brewer(palette = "Dark2") + 
+  theme_bw() + labs(
+    x = "Rinkinio pavadinimas",
+    y = "Regionų skaičius genome",
+    fill = "Regiono kategorija",
+  ) + theme(
+        strip.text.x = element_text(size = 16),
+        axis.text.x = element_text(size = 14, face = 'bold'),
+        axis.text.y = element_text(size = 14),
+        axis.title = element_text(size = 18),
+        title = element_text(size = 22),
+        legend.key.size = unit(0.5, 'cm'), 
+        legend.title = element_text(size= 12), 
+        legend.text = element_text(size=12), 
+        legend.position = 'top') 
+
+
+GCskaicius <- count_dt %>%  filter(group_poster == "GC+") %>% .$n
+bendrasskaicius <- count_dt %>% group_by(rinkinys) %>% 
+  summarise(suma = sum(n)) %>% .$suma
+GCskaicius / bendrasskaicius * 100
+
+set_dt <- full_dt %>% ungroup() %>% filter(nCG > 0) %>% 
+  mutate(nCG = cut(nCG, 
+  breaks=c(1, 5, 10, 15, 20, 25, 30, 35, 40, max(nCG)), include.lowest=TRUE)) 
+count_dt <- set_dt %>% count(rinkinys, group_poster, nCG)
+
+gg2 <- ggplot(count_dt, aes(x = nCG, y = n, fill = group_poster)) + 
+  geom_col(position = "dodge", color = 'black') + theme_bw() + 
+#  geom_text(aes(label = n, y = n + 0.5), position = position_dodge(0.9), 
+#  vjust = 0.5, angle = 90, size = 3) +
+  facet_grid(cols = vars(rinkinys)) + 
+  scale_fill_brewer(palette = "Dark2") +
+  labs(
+    x = "CG skaičiaus intervalas",
+    y = "Regionų skaičius",
+    title = "",
+    fill = "Regiono kategorija"
+  ) + theme(
+        strip.text.x = element_text(size = 16),
+        axis.text.x = element_text(size = 14, face = 'bold', angle = 90),
+        axis.text.y = element_text(size = 14),
+        axis.title = element_text(size = 18),
+        title = element_text(size = 22),
+        legend.key.size = unit(1, 'cm'), 
+        legend.title = element_text(size= 14), 
+        legend.text = element_text(size=14), 
+        legend.position = 'bottom') 
+
+
+ggsave(filename = "output/code/prepdata/paveikslai/bakalauras_bonus/3_3_WGBS_grupes_CGskaicius.png",
+                plot = gg2, width = 420, height = 210, units = "mm")
+
+
+outFile <- paste0(outdatadir, "lentele_mCG_uCG_hmC_groupposter_rinkinys.Rds")
+if(!(file.exists(outFile))) {
+dtBis <- fread(paste0("/mnt/store/DMTS/mESC_openChrom/regions/GSM1372647_markdup_CpG.bedGraph"), skip = 1) %>%
+         setnames(c("seqnames", "start", "end", "m_level", "mCG", "uCG")) ## Bis4
+dtBis$seqnames <- factor(dtBis$seqnames)
+dtBis <- dtBis %>% mutate(start = start+1 , end = start)
+sets <- c(1:4)
+tmp1 <- dtBis %>% makeGRangesFromDataFrame(keep.extra.columns = TRUE)
+lentele <- foreach(i = sets) %do% {
+  print(i)
+dt <- readRDS(file_names[i]) 
+tmp2 <- dt[[1]] %>% as.data.table() %>% 
+  select(seqnames, start, end, width, strand, uCG, group_poster, nCG, hmC, width) %>%
+  rename(uCG = "uCG_n") %>%
+  makeGRangesFromDataFrame(keep.extra.columns = TRUE) 
+ov <- findOverlaps(tmp2, tmp1) 
+tmp2_matched <- tmp2[queryHits(ov)]
+mcols(tmp2_matched) <- cbind.data.frame(
+    mcols(tmp2_matched),
+    mcols(tmp1[subjectHits(ov)]))
+tmp3 <- as.data.table(tmp2_matched) %>% regionbin() %>%
+        group_by(regionID, group_poster) %>%  summarise(
+          mCG = sum(mCG) / sum(mCG + uCG),
+          uCGsk = mean(uCG_n),
+          nCG = mean(nCG),
+          hmCsk = mean(hmC),
+          width = mean(width)) %>%
+      setnames(c("regionID", "group_poster", paste0(i, "_mCG"), 
+                             paste0(i, "_uCGsk"), paste0(i, "_nCG"), 
+                             paste0(i, "_hmCsk"), paste0(i, "_width"))) 
+}
+
+full_dt <- Reduce(full_join, lentele) %>%
+ pivot_longer(cols = -c("regionID", "group_poster"), 
+ names_to = c("rinkinys", ".value"), names_sep = "_")
+full_dt <- full_dt[complete.cases(full_dt),]
+saveRDS(full_dt, outFile)
+}
+
+
+full_dt <- readRDS(outFile)
+full_dt <- full_dt %>% filter(nCG > 0)
+full_dt$rinkinys <- factor(full_dt$rinkinys, 
+  levels = c("1", "2", "3", "4"), 
+  labels = pavadinimai)
+full_dt$group_poster <- factor(full_dt$group_poster, 
+  levels = c("hmC+", "uCG+", "uCG+_hmC+", "uCG-_hmC-", "GC_only"),
+  labels = c("hmCG+", "uCG+", "uCG+hmCG+", "uCG-hmCG-", "GC+"))
+
+
+gg3 <- ggplot(full_dt, aes(x = rinkinys, y = mCG, fill = group_poster)) + 
+  geom_boxplot() + theme_bw() + 
+  scale_fill_brewer(palette = "Dark2") +
+  labs(
+    x = "Rinkinio pavadinimas",
+    y = "Vidutinis metilinimas",
+    fill = "Regiono grupė"
+  ) + theme(
+        strip.text.x = element_text(size = 16),
+        axis.text.x = element_text(size = 14, face = 'bold'),
+        axis.text.y = element_text(size = 14),
+        axis.title = element_text(size = 18),
+        title = element_text(size = 22),
+        legend.key.size = unit(1, 'cm'), 
+        legend.title = element_text(size= 18), 
+        legend.text = element_text(size=16), 
+        legend.position = 'none') 
+ #+ 
+      # stat_summary(fun.data = give.n, geom = "text", fun.y = median,
+       #           position = position_dodge(width = 0.75), angle = 90, size = 2) 
+
+full_dt %>% group_by(group_poster, rinkinys) %>% summarise(vidurkis = mean(mCG), sd = sd(mCG))
+
+full_dt <- full_dt %>% ungroup() %>% mutate(uCGsk = 
+case_when(
+  uCGsk  ==  0 ~ "0",
+  uCGsk < 3   ~ "[1,2]",
+  uCGsk < 6   ~ "[3,5]",
+  uCGsk < 10  ~ "[6,9]",
+  uCGsk > 9   ~ "10+"
+  ))
+full_dt$uCGsk <- factor(full_dt$uCGsk, 
+levels = c("0", "[1,2]", "[3,5]", "[6,9]", "10+"))
+
+filtered_dt <- full_dt %>% filter(group_poster != "GC+") %>% 
+  filter(rinkinys %in% c("lGC", "gGC"))
+
+full_dt %>% group_by(rinkinys, group_poster, uCGsk) %>% summarise ( 
+  median = median(mCG), sd = sd(mCG)
+)
+
+gg4 <- ggplot(filtered_dt, aes(x = uCGsk, y = mCG)) + 
+ geom_boxplot(fill = "#1b9e77") + 
+ #scale_fill_brewer(palette = "Dark2") +
+  theme_bw() + 
+  theme(axis.text.x = element_text(angle = 45),
+      strip.text = element_text(size = 10, margin = margin())) +
+  #scale_y_continuous(limits =c(-0.3, 1.3)) + 
+  facet_wrap(rinkinys~group_poster, ncol = 4, nrow = 4, scale = "free_x") + 
+  labs(
+    x = "uCG skaičiaus intervalas",
+    y = "Vidutinis metilinimas regione"
+  ) + theme(
+        strip.text.x = element_text(size = 16),
+        axis.text.x = element_text(size = 14, face = 'bold', angle = 90),
+        axis.text.y = element_text(size = 14),
+        axis.title = element_text(size = 18),
+        title = element_text(size = 22),
+        legend.key.size = unit(1, 'cm'), 
+        legend.title = element_text(size= 18), 
+        legend.text = element_text(size=16)) 
+
+       #stat_summary(fun.data = give.n, geom = "text", fun.y = median,
+       #           position = position_dodge(width = 0.75), angle = 90, size = 3) 
+
+filtered_dt %>% group_by(uCGsk, rinkinys, group_poster) %>% 
+  summarise(mean = mean(mCG), sd = sd(mCG))
+p0 <- ((gg1 / gg3) | gg4)  + 
+plot_annotation(tag_levels = 'a') & 
+  theme(plot.tag = element_text(face = 'bold'))
+p0
+p0 <- ggarrange(p0)
+ggsave(filename = "output/code/prepdata/paveikslai/bakalauras/3_4_WGBS_metilinimas_grupes.png",
+                plot = p0, width = 420, height = 210, units = "mm")
+
+
+outFile <- paste0(outdatadir, "lentele_elementai_groupposter_rinkinys.Rds")
+if(!(file.exists(outFile))) {
+anotacija <- readRDS(paste0(outdatadir, "promotoriu_anotacija.Rds"))
+anotacija$seqnames <- gsub("^chr", "", anotacija$seqnames)
+elementai <- c("promoter", "gene", "other")
+sets <- c(1:4)
+lentele <- foreach(i = sets) %do% {
+  print(i)
+dt <- readRDS(file_names[i]) 
+tmp1 <- dt[[1]] %>% as.data.table() %>% 
+  select(seqnames, start, end, width, strand, uCG, group_poster, nCG, hmC, width) %>%
+  rename(uCG = "uCG_n") %>%
+  makeGRangesFromDataFrame(keep.extra.columns = TRUE) 
+foreach(j = elementai) %do% {
+    if (j == "promoter") {
+       print(j)
+tmp2 <- as.data.frame(anotacija) %>% filter(grepl("promotorius", type)) %>% makeGRangesFromDataFrame()
+ goodCG <- countOverlaps(tmp1, tmp2)
+ final <- tmp1[goodCG > 0]
+    } else if (j == "gene") {
+        print(j)
+tmp2 <- as.data.frame(anotacija) %>% filter(grepl("genas", type)) %>% makeGRangesFromDataFrame()
+ goodCG <- countOverlaps(tmp1, tmp2) 
+  final <- tmp1[goodCG > 0]
+    } else {
+        print(j)
+tmp2 <- as.data.frame(anotacija) %>% makeGRangesFromDataFrame()
+ goodCG <- countOverlaps(tmp1, tmp2) 
+  final <- tmp1[goodCG == 0]
+    }  
+tmp3 <- as.data.table(final) %>% regionbin() %>%
+        select(regionID, group_poster, uCG_n, nCG, hmC) %>%
+      setnames(c("regionID", "group_poster",
+                  paste0(i, "_", j, "_uCGsk"), paste0(i, "_", j, "_nCG"), 
+                  paste0(i, "_", j, "_hmCsk"))) 
+}}
+
+num_keep <- c(1:4)
+linked_sample <- foreach(i = num_keep) %do% {
+    Reduce(full_join, lentele[[i]])  %>%
+   pivot_longer(-c("regionID", "group_poster"), names_to = c("rinkinys", "elementas", ".value"), 
+               names_sep= "_") 
+}
+full_dt <- Reduce(rbind, linked_sample)
+full_dt <- full_dt[complete.cases(full_dt),]
+saveRDS(full_dt, outFile)
+}
+
+full_dt <- readRDS(outFile)
+full_dt$rinkinys <- factor(full_dt$rinkinys, 
+  levels = c("1", "2", "3", "4"), 
+  labels = pavadinimai)
+full_dt$group_poster <- factor(full_dt$group_poster, 
+  levels = c("hmC+", "uCG+", "uCG+_hmC+", "uCG-_hmC-", "GC_only"),
+  labels = c("hmCG+", "uCG+", "uCG+hmCG+", "uCG-hmCG-", "GC+"))
+count_dt <- full_dt %>% count(rinkinys, group_poster, elementas)
+
+count_dt %>% filter(rinkinys == 'lGC') %>% pivot_wider(names_from = elementas,
+values_from = n)  %>% mutate(promoter_dalis =  promoter / (promoter + gene + other))
+
+count_dt %>% filter(rinkinys == 'lGC') %>% pivot_wider(names_from = group_poster,
+values_from = n) %>% mutate(uCG_dalis =  `uCG+` / (`hmCG+` + `uCG+` + `uCG+hmCG+` + `uCG-hmCG-` + `GC+`) * 100,
+                            )
+
+
+```
+
+# 3.5 hmCG analizė papildoma
+```{r}
+outFile <- paste0(outdatadir, "lentele_mCG_uCG_hmC_groupposter_rinkinys_bis4NEW.Rds")
+if(!(file.exists(outFile))) {
+dtBis <- fread(paste0("/mnt/store/DMTS/mESC_openChrom/regions/GSM1372647_markdup_CpG.bedGraph"), skip = 1) %>%
+         setnames(c("seqnames", "start", "end", "m_level", "mCG", "uCG")) ## Bis4
+dtBis$seqnames <- factor(dtBis$seqnames)
+dtBis <- dtBis %>% mutate(start = start+1 , end = start)
+###
+sets <- c(1:4)
+tmp1 <- dtBis %>% makeGRangesFromDataFrame(keep.extra.columns = TRUE)
+lentele <- foreach(i = sets) %do% {
+  print(i)
+dt <- readRDS(file_names[i]) 
+tmp2 <- dt[[1]] %>% as.data.table() %>% 
+  select(seqnames, start, end, width, strand, uCG, group_poster, nCG, hmC, width,
+  uCG_fraction) %>%
+  rename(uCG = "uCG_n") %>%
+  makeGRangesFromDataFrame(keep.extra.columns = TRUE) 
+ov <- findOverlaps(tmp2, tmp1) 
+tmp2_matched <- tmp2[queryHits(ov)]
+mcols(tmp2_matched) <- cbind.data.frame(
+    mcols(tmp2_matched),
+    mcols(tmp1[subjectHits(ov)]))
+tmp3 <- as.data.table(tmp2_matched) %>% regionbin() %>%
+        group_by(regionID, group_poster) %>%  summarise(
+          mCG = sum(mCG) / sum(mCG + uCG),
+          uCGsk = mean(uCG_n),
+          nCG = mean(nCG),
+          uCGfrac = mean(uCG_fraction),
+          hmCsk = mean(hmC),
+          width = mean(width)) %>%
+      setnames(c("regionID", "group_poster", paste0(i, "_mCG"), 
+                             paste0(i, "_uCGsk"), paste0(i, "_nCG"),
+                             paste0(i, "_uCGfrac"), 
+                             paste0(i, "_hmCsk"), paste0(i, "_width")))
+}
+
+full_dt <- Reduce(full_join, lentele) %>%
+ pivot_longer(cols = -c("regionID", "group_poster"), 
+ names_to = c("rinkinys", ".value"), names_sep = "_")
+full_dt <- full_dt[complete.cases(full_dt),]
+saveRDS(full_dt, outFile)
+}
+
+full_dt <- readRDS(outFile)
+full_dt$rinkinys <- factor(full_dt$rinkinys, 
+  levels = c("1", "2", "3", "4"), 
+  labels = pavadinimai)
+full_dt$group_poster <- factor(full_dt$group_poster, 
+  levels = c("hmC+", "uCG+", "uCG+_hmC+", "uCG-_hmC-", "GC_only"),
+  labels = c("hmCG+", "uCG+", "uCG+hmCG+", "uCG-hmCG-", "GC+"))
+
+full_dt <- full_dt %>% ungroup() %>% mutate(uCGsk = 
+case_when(
+  uCGsk  ==  0 ~ "0",
+  uCGsk < 3   ~ "[1,2]",
+  uCGsk < 6   ~ "[3,5]",
+  uCGsk < 10  ~ "[6,9]",
+  uCGsk < 20  ~ "[10,19]",
+  uCGsk > 19  ~ "20+"
+  ))
+full_dt$uCGsk <- gsub("^", "uCG = ", full_dt$uCGsk)
+full_dt$uCGsk <- factor(full_dt$uCGsk, 
+  levels = c("uCG = 0", "uCG = [1,2]", "uCG = [3,5]", "uCG = [6,9]", "uCG = [10,19]", "uCG = 20+"))
+
+full_dt <- full_dt %>% ungroup() %>% filter(nCG > 0) %>% 
+  mutate(width = cut(width, 
+  breaks=c(0, 50, 100, 150, 200, 250, 500, max(width)), include.lowest=TRUE))
+
+full_dt <- full_dt %>% ungroup() %>% mutate(nCG = 
+case_when(
+  nCG  ==  0 ~ "0",
+  nCG < 3   ~ "[1,2]",
+  nCG < 6   ~ "[3,5]",
+  nCG < 10  ~ "[6,9]",
+  nCG < 20  ~ "[10,19]",
+  nCG > 19  ~ "20+"
+  ))
+
+full_dt$nCG <- factor(full_dt$nCG, 
+  levels = c("0", "[1,2]", "[3,5]", "[6,9]", "[10,19]", "20+"))
+
+
+tmp1 <- full_dt %>% ungroup() %>% filter(rinkinys == 'lGC', hmCsk == 0) 
+
+data.table(
+          "estimate" = cor.test(tmp1$mCG, tmp1$uCGfrac, method = "spearman")$estimate,
+          "pvalue" = cor.test(tmp1$mCG, tmp1$uCGfrac, method = "spearman")$p.value)
+
+
+ggplot(tmp1, aes(x = mCG, y = uCGfrac)) + geom_point() + theme_bw()
+
+full_dt <- full_dt %>% ungroup() %>% mutate(hmCsk = 
+case_when(
+  hmCsk  ==  0 ~ "0",
+  hmCsk < 3   ~ "[1,2]",
+  hmCsk < 6   ~ "[3,5]",
+  hmCsk < 10  ~ "[6,9]",
+  hmCsk < 20  ~ "[10,19]",
+  hmCsk > 19  ~ "20+"
+  ))
+full_dt$hmCsk <- factor(full_dt$hmCsk, 
+  levels = c("0", "[1,2]", "[3,5]", "[6,9]", "[10,19]", "20+"))
+
+
+
+
+set_dt <- full_dt %>%
+  mutate(uCGfracint = cut(uCGfrac, 
+  breaks=c(0, 0.2, 0.4, 0.6, 0.8, max(uCGfrac)), include.lowest=TRUE))
+
+filtered_dt <- set_dt %>% filter(rinkinys == "lGC")
+
+
+gg1 <- ggplot(filtered_dt, aes(x = hmCsk,  y = mCG, fill = nCG)) + 
+  geom_boxplot() + theme_bw() + scale_fill_brewer(palette = "Dark2") +
+  facet_grid(rows = vars(uCGsk)) + labs(
+    x = "hmCG skaičius regione",
+    y = "Vidutinis metilinimas",
+    fill = "CG skaičius regione"
+  ) + theme(
+        strip.text.y = element_text(size = 12),
+        axis.text.x = element_text(size = 14, face = 'bold', angle = 90),
+        axis.text.y = element_text(size = 14),
+        axis.title = element_text(size = 18),
+        title = element_text(size = 22),
+        legend.key.size = unit(1, 'cm'), 
+        legend.title = element_text(size= 14), 
+        legend.text = element_text(size=14), 
+        legend.position = 'bottom') 
+
+gg2 <- ggplot(filtered_dt, aes(x = uCGsk, y = mCG)) +
+ geom_boxplot(fill ="#1b9e77") + theme_bw() + 
+ facet_grid(rows = vars(hmCsk)) + labs(
+    x = "hmCG skaičius regione",
+    y = "Vidutinis metilinimas"
+  ) + theme(
+        strip.text.y = element_text(size = 12),
+        axis.text.x = element_text(size = 14, face = 'bold', angle = 90),
+        axis.text.y = element_text(size = 14),
+        axis.title = element_text(size = 18),
+        title = element_text(size = 22),
+        ) 
+
+ggsave(filename = "output/code/prepdata/paveikslai/bakalauras/3_5_WGBS_metilinimas_hmC.png",
+                plot = gg1, width = 420, height = 210, units = "mm")  
+
+
+ggsave(filename = "output/code/prepdata/paveikslai/bakalauras/3_5_WGBS_metilinimas_hmC2.png",
+                plot = gg2, width = 420, height = 210, units = "mm")  
+```
