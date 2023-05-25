@@ -1,0 +1,472 @@
+```{r setup}
+library(pacman)
+p_load(data.table, dplyr, ggplot2, foreach, 
+GenomicRanges, yaml, purrr, fs, stringr, tximport, edgeR, tidyr, ggseqlogo, corrplot,
+factoextra, ggstatsplot, tidyverse, ggpubr, GEOquery, rtracklayer, gridExtra, 
+rstatix, ggprism, rtracklayer, knitr, patchwork, ggcorrplot, Rsamtools, tidytext, scales)
+outdatadir <- "output/code/prepdata/"
+grafikai <- "output/code/prepdata/grafikai/"
+options(scipen=999)
+knitr::opts_chunk$set(echo = TRUE, fig.width = 20, fig.height = 12)
+
+
+# Funkcijos 
+bin <- function(dt, bins = 100) {
+    dt[, binID := paste0(seqnames,"_", floor(start/bins))]
+    return(dt)
+}
+
+regionbin <- function(dt) {
+  dt[, regionID := paste0(seqnames, "_", start,"_", end)]
+  return(dt)
+}
+
+give.n <- function(x){
+  return(c(y = median(x)*1.10, label = length(x))) }
+
+# Failai
+file_names <- fs::dir_ls("/mnt/store/DMTS/mESC_openChrom/regions/", regexp = "Final")
+#dtuCG <- readRDS("/mnt/store/DMTS/mESC_openChrom/regions/Cov_data_triple.RDS")
+#total <- dtuCG$total
+#saveRDS(total, "./input/total.RDS")
+#total <- total %>% as.data.table() %>% setnames("TT_S0", "TT_S0_deep") 
+pavadinimai <- c("lGC", "lGCCG", "gGC", "gGCCG")
+```
+
+# 1.1 Regionų skaičius
+
+```{r}
+sets <- c(1:4)
+count_table <- foreach(i = sets, .combine = 'cbind') %do% {
+  print(i)
+dt <- readRDS(file_names[i]) 
+tmp1 <- data.table(nrow(as.data.table(dt[[1]]))) %>% setnames(paste0(i))
+}
+
+full_dt <- pivot_longer(count_table, cols = everything(), names_to = "rinkinys", values_to = "skaicius")
+full_dt$rinkinys <- factor(full_dt$rinkinys, 
+  levels = c("1", "2", "3", "4"), 
+  labels = pavadinimai)
+
+gg1 <- ggplot(full_dt, aes(x = rinkinys, y = skaicius)) + 
+  geom_col(colour="black", fill = "#1b9e77") +
+  theme_bw() + 
+  theme(axis.text.x = element_text(size = 20, angle = 45, vjust= 1, hjust = 1),
+        axis.text.y = element_text(size = 18),
+        axis.title = element_text(size = 22),
+        title = element_text(size = 26)) +
+  scale_y_continuous(labels = label_number(suffix = "K", scale = 1e-3)) +      
+  labs(
+    x = "Rinkinys",
+    y = "Regionų skaičius genome",
+    title = "a"
+  )
+
+laisvesnis <- full_dt %>% filter(rinkinys %in% c("75_75_GC", "75_75_GCCG")) %>% 
+  summarise(vidurkis = mean(skaicius)) %>% .$vidurkis
+grieztesnis  <- full_dt %>% filter(rinkinys %in% c("95_90_GC", "95_90_GCCG")) %>% 
+  summarise(vidurkis = mean(skaicius)) %>% .$vidurkis
+GC <- full_dt %>% filter(rinkinys %in% c("75_75_GC", "95_90_GC")) %>% 
+  summarise(vidurkis = mean(skaicius)) %>% .$vidurkis
+GCCG <- full_dt %>% filter(rinkinys %in% c("75_75_GCCG", "95_90_GCCG")) %>% 
+  summarise(vidurkis = mean(skaicius)) %>% .$vidurkis
+
+print(paste0("KieK kartų laisvesnių regionų daugiau už griežtesnių: ", laisvesnis / grieztesnis))
+print(paste0("KieK kartų  GC signalo regionų daugiau už GCCG: ", GC / GCCG))
+
+outFile <- paste0(outdatadir, "regionu_persidengimas_skaicius.Rds") 
+if(!(file.exists(outFile))) {
+sets <- c(1:4)
+lentele <- foreach(i = sets, .combine = 'rbind') %do% {
+  print(i)
+dt <- readRDS(file_names[i]) 
+tmp1 <- dt[[1]] %>% as.data.table() %>%   
+               select(seqnames, start, end, width, strand) %>%
+               regionbin() %>%
+              makeGRangesFromDataFrame(keep.extra.columns = TRUE)
+    foreach(j = sets, .combine = 'cbind') %do% {
+  print(j)
+dt <- readRDS(file_names[j]) 
+tmp2 <- dt[[1]] %>% as.data.table() %>% 
+               select(seqnames, start, end, width, strand) %>%
+               regionbin() %>%
+              makeGRangesFromDataFrame(keep.extra.columns = TRUE)
+good <- countOverlaps(tmp1, tmp2) 
+matched <- tmp1[good > 0] %>% as.data.table()
+final <- nrow(matched) / nrow(as.data.table(tmp1)) %>%
+as.data.table() %>% setnames(paste0(str_extract(file_names[j], "regions_.._.._[G,C]*")))
+}}
+lentele <- lentele %>% setnames(pavadinimai)
+lentele <- as.matrix(lentele)
+rownames(lentele) = colnames(lentele) 
+saveRDS(lentele, outFile)
+}
+
+lentele <- readRDS(outFile)
+gg2 <- ggcorrplot(lentele, lab = TRUE, lab_size = 8, digits = 5, colors = c("#e6ab02", "#66a61e", "#1b9e77")) + 
+ggplot2::labs(
+  x = "Rinkinys, kurio regionams ieškota persidengimo",
+  y = "Rinkinys, kurio regionai perdengiami",
+  title = "b") +
+  ggplot2::theme(legend.position = "none",
+    axis.text.x = element_text(size = 18), 
+    axis.text.y = element_text(size = 18), 
+    axis.title.x = element_text(angle = 0, size = 18),
+    axis.title.y = element_text(angle = 90, size = 18),
+    title = element_text(size = 26))
+
+p0 <- ggarrange(gg1, gg2)
+p0 <- ggarrange(p0)
+ggsave(filename = "output/code/prepdata/paveikslai/bakalauras/1_1_rinkiniai_regionu_skaicius.png",
+                plot = p0, width = 420, height = 210, units = "mm", bg = "white")
+```
+
+# 1.2 Regionų ilgis
+
+```{r}
+sets <- c(1:4)
+lentele <- foreach(i = sets) %do% {
+  print(i)
+dt <- readRDS(file_names[i]) 
+tmp1 <- dt[[1]] %>% as.data.table() %>% regionbin() %>% 
+    select(regionID, width) %>% setnames(c("regionID", paste0(i, "_width"))) 
+}
+
+full_dt <- Reduce(full_join, lentele) %>% 
+  pivot_longer(., cols = -regionID, 
+  names_to = c("rinkinys", ".value"), names_sep = "_")
+
+full_dt <- full_dt[complete.cases(full_dt),]
+
+
+full_dt$rinkinys <- factor(full_dt$rinkinys, 
+  levels = c("1", "2", "3", "4"), 
+  labels = pavadinimai)
+
+gg1 <- ggplot(full_dt, aes(x = rinkinys, y = width)) + 
+  geom_boxplot(fill = "#1b9e77") +
+  scale_y_continuous(trans = 'log10') + 
+  theme_bw() + labs(
+    x = "Rinkinio pavadinimas",
+    y = "Regiono ilgis (bp)",
+    title = "a"
+  ) + theme(axis.text.x = element_text(size = 16, angle = 45, vjust= 1, hjust = 1),
+        axis.text.y = element_text(size = 14),
+        axis.title = element_text(size = 18),
+        title = element_text(size = 22)) 
+
+gg2 <- ggplot(full_dt, aes(x = rinkinys, y = width)) + 
+  geom_violin(fill = "#d95f02") +
+  scale_y_continuous(trans = 'log10') + 
+  theme_bw() + labs(
+    x = "Rinkinio pavadinimas",
+    y = "Regiono ilgis (bp)"
+  )  + theme(axis.text.x = element_text(size = 16, angle = 45, vjust= 1, hjust = 1),
+        axis.text.y = element_text(size = 14),
+        axis.title = element_text(size = 18))
+
+
+stat_dt <- full_dt %>% group_by(rinkinys) %>%
+  summarise(mediana = median(width),
+            sd = sd(width))
+
+
+outFile <- paste0(outdatadir, "regionu_persidengimas_ilgis2.Rds") # pakeisti _1!!!
+if(!(file.exists(outFile))) {
+sets <- c(1:4)
+lentele <- foreach(i = sets, .combine = 'rbind') %do% {
+  print(i)
+dt <- readRDS(file_names[i]) 
+tmp1 <- dt[[1]] %>% as.data.table() %>% #filter(nCG > 0) %>%  
+               select(seqnames, start, end, width, strand) %>%
+               regionbin() %>%
+              makeGRangesFromDataFrame(keep.extra.columns = TRUE)
+    foreach(j = sets, .combine = 'cbind') %do% {
+  print(j) 
+dt <- readRDS(file_names[j]) 
+tmp2 <- dt[[1]] %>% as.data.table() %>% #filter(nCG > 0) %>%  
+               select(seqnames, start, end, width, strand) %>%
+               regionbin() %>%
+              makeGRangesFromDataFrame(keep.extra.columns = TRUE)
+good <- subsetByOverlaps(tmp1, tmp2) %>% as.data.table()
+final <- sum(good$width) / sum(as.data.table(tmp1)$width) %>%
+as.data.table() %>% setnames(paste0(str_extract(file_names[j], "regions_.._.._[G,C]*")))
+}}
+lentele <- lentele %>% setnames(pavadinimai)
+lentele <- as.matrix(lentele)
+rownames(lentele) = colnames(lentele) 
+saveRDS(lentele, outFile)
+}
+
+
+lentele <- readRDS(outFile)
+gg3 <- ggcorrplot(lentele, lab = TRUE, lab_size = 8, digits = 5, colors = c("#e6ab02", "#66a61e", "#1b9e77")) + 
+ggplot2::labs(
+  x = "Rinkinys, kurio regionams ieškota persidengimo",
+  y = "Rinkinys, kurio regionai perdengiami",
+  title = "b") +
+  ggplot2::theme(legend.position = "none",
+    axis.text.x = element_text(size = 16), 
+    axis.text.y = element_text(size = 16), 
+    axis.title.x = element_text(angle = 0, size = 17),
+    axis.title.y = element_text(angle = 90, size = 17),
+    title = element_text(size = 22))
+
+outFile <- paste0(outdatadir, "persidengiantys_nepersidengiantys_ilgis.Rds")
+if(!(file.exists(outFile))) {
+sets <- c(1:4)
+lentele <- foreach(i = sets) %do% {
+  print(i)
+dt <- readRDS(file_names[i]) 
+tmp1 <- dt[[1]] %>% as.data.table() %>%
+               select(seqnames, start, end, width, strand) %>%
+               regionbin() %>%
+              makeGRangesFromDataFrame(keep.extra.columns = TRUE)
+    foreach(j = sets) %do% {
+  print(j) 
+dt <- readRDS(file_names[j]) 
+tmp2 <- dt[[1]] %>% as.data.table() %>%
+               select(seqnames, start, end, width, strand) %>%
+               regionbin() %>%
+              makeGRangesFromDataFrame(keep.extra.columns = TRUE)
+good <- countOverlaps(tmp1, tmp2)
+matched <- tmp1[good > 0] %>% as.data.table() %>% 
+mutate(isOverlapped = "yes") %>% select(width, isOverlapped)
+notmatched <- tmp1[good == 0] %>% as.data.table() %>% 
+mutate(isOverlapped = "no") %>% select(width, isOverlapped)
+final <- rbind(matched, notmatched) %>% mutate(name = paste0(i, "_", j))
+}}
+numkeep <- c(1:4)
+linked_sample <- foreach(i = numkeep) %do% {
+Reduce(rbind, lentele[[i]]) 
+}
+
+full_dt <- Reduce(rbind, linked_sample)
+full_dt <- separate(full_dt, col = name, 
+    into = c("name1", "name2"), sep = "_")
+saveRDS(full_dt, outFile)
+}
+
+
+full_dt <- readRDS(outFile)
+full_dt$name1 <- factor(full_dt$name1, 
+  levels = c("1", "2", "3", "4"), 
+  labels = pavadinimai)
+full_dt$name2 <- factor(full_dt$name2, 
+  levels = c("1", "2", "3", "4"), 
+ labels = pavadinimai)
+full_dt$isOverlapped <- factor(full_dt$isOverlapped,
+  levels =c("yes", "no"), labels = c("taip", "ne"))
+laisvesnis <- full_dt %>% filter(name1 %in% c("lGC", "lGCCG")) %>% 
+  unite(col = "kombinacija", name1, name2, sep = "A") %>% 
+  filter(!(kombinacija %in% c("lGCAlGC", "lGCCGAlGCCG"))) %>% ungroup() %>%
+  separate(col = kombinacija, into = c("name1", "name2"), sep = "A") 
+gg4 <- ggplot(laisvesnis, aes(x = name2, y = width, fill = isOverlapped)) + 
+ geom_boxplot() + scale_fill_brewer(palette = "Dark2") +
+  theme_bw() + 
+  scale_y_continuous(trans = 'log10') + 
+  facet_wrap(~name1, nrow = 1, scales = 'free_x') + 
+  labs(
+    x = "Rinkiniai kurių regionai lyginti su tiriamu rinkiniu",
+    y = "Regionų ilgis (bp)",
+    fill = "Ar regionas yra persidengęs",
+    title = "c") + theme(
+        strip.text.x = element_text(size = 16),
+        legend.key.size = unit(1, 'cm'), 
+        legend.title = element_text(size= 18), 
+        legend.text = element_text(size=16),
+        axis.text.x = element_text(size = 16, angle = 45, vjust= 1, hjust = 1),
+        axis.text.y = element_text(size = 14),
+        axis.title = element_text(size = 18),
+        title = element_text(size = 22),
+        legend.position = 'bottom')
+
+
+stat_dt <- laisvesnis %>% group_by(name1, name2, isOverlapped) %>%
+  summarise(mediana = median(width),
+            sd = sd(width))
+lGC_taip <- stat_dt %>% filter(isOverlapped == "taip" & name1 == "lGC") %>% .$mediana %>% mean()
+lGC_ne <- stat_dt %>% filter(isOverlapped == "ne" & name1 == "lGC") %>% .$mediana %>% mean()
+lGCCG_taip <- stat_dt %>% filter(isOverlapped == "taip" & name1 == "lGCCG") %>% .$mediana %>% mean()
+lGCCG_ne <- stat_dt %>% filter(isOverlapped == "ne" & name1 == "lGCCG") %>% .$mediana %>% mean()
+
+print(paste0("lGC persidengę regionai vidutiniškai ", round(lGC_taip / lGC_ne, 2), " karto didesni už nepersidengusius"))
+print(paste0("lGCCG persidengę regionai vidutiniškai ", round(lGCCG_taip / lGCCG_ne, 2),  " karto didesni už nepersidengusius"))
+
+
+p0 <- ((gg1 / gg4 )| gg3) #+
+  #plot_annotation(tag_levels = 'a') & 
+  #theme(plot.tag = element_text(face = 'bold'))
+p0
+p0 <- ggarrange(p0)
+ggsave(filename = "output/code/prepdata/paveikslai/bakalauras/1_2_rinkiniai_regionu_ilgis.png",
+                plot = p0, width = 420, height = 210, units = "mm")
+ggsave(filename = "output/code/prepdata/paveikslai/bakalauras_bonus/1_2_violin_regionu_ilgis.png",
+                plot = gg2, width = 420, height = 210, units = "mm")                
+```
+
+# 1.3 Praturtinimo analizė 
+
+
+```{r}
+outFile <- paste0(outdatadir, "enrichment_alltargets_regions_elementsNEW.Rds")
+elementai <- c("Promoter", "CGIall", "exon", "intron",
+"UTR3", "UTR5", "intergenic", "RptSINE", "RptLINE")
+if(!(file.exists(outFile))) {
+dtanno <- readRDS("./input/data_annotation_final.RDS")
+dtanno$chr <- gsub("^chr", "", dtanno$chr)
+dtanno$element <- gsub(" ", "", dtanno$element)
+dtanno$element <- gsub("_", "", dtanno$element)
+dtanno <- dtanno %>% rename(chr = "seqnames")
+targets <- c("hmC", "uCG", "uGC", "total")
+dtuCG <- readRDS("/mnt/store/DMTS/mESC_openChrom/regions/Cov_data_triple.RDS")
+sets <-c(1:4)
+
+
+lentele <- foreach(z = targets) %do% {
+print(z)
+tmp1 <- dtuCG[[z]] %>% as.data.table() %>%
+  select(seqnames, start, end, strand, TT_S0) %>% 
+  setnames("TT_S0", "coverage") %>%
+  makeGRangesFromDataFrame(keep.extra.columns = TRUE)
+ foreach(i = sets) %do% {
+  print(i)
+dt <- readRDS(file_names[i]) 
+tmp2 <- dt[[1]] %>% as.data.table() %>% 
+  select(seqnames, start, end, width, strand) %>%
+  makeGRangesFromDataFrame(keep.extra.columns = TRUE)
+ov <- findOverlaps(tmp2, tmp1) 
+tmp2_matched <- tmp2[queryHits(ov)]
+mcols(tmp2_matched) <- cbind.data.frame(
+    mcols(tmp2_matched),
+    mcols(tmp1[subjectHits(ov)]))
+tmp3 <- tmp2_matched %>% as.data.table() %>% mutate(inregion = "yes") %>%
+full_join(., as.data.table(tmp1))
+tmp3[is.na(tmp3)] <- "no"
+tmp3 <- tmp3 %>% mutate(coverage = if_else(inregion == "no", 0, coverage)) %>% 
+makeGRangesFromDataFrame(keep.extra.columns = TRUE)
+ foreach(j = elementai) %do% {
+    print(j)
+tmp4 <- as.data.table(dtanno) %>% filter(grepl(j, element)) %>% 
+  makeGRangesFromDataFrame()
+ goodCG <- countOverlaps(tmp3, tmp4)
+ final <- tmp3[goodCG > 0] %>% as.data.table()
+sk1 <- sum(final$coverage > 0)
+sk2 <- sum(tmp3$coverage > 0) - sk1
+sk3 <- sum(final$coverage == 0)
+sk4 <- sum(tmp3$coverage == 0) - sk3
+  value <- data.table(
+    "ratio" = unname(fisher.test(matrix(c(sk1, sk2, sk3, sk4), 2, 2))$estimate),
+    "pvalue" = fisher.test(matrix(c(sk1, sk2, sk3, sk4), 2, 2))$p.value) %>%
+            setnames(c(paste0(z, "_", i, "_", j, "_ratio"), paste0(z, "_", i, "_", j, "_pvalue"))) 
+}}}
+
+num_keep1 <- c(1:4)
+num_keep2 <- c(1:4)
+linked_sample <- foreach(i = num_keep1) %do% {
+   foreach(j = num_keep2) %do% {
+Reduce(cbind, lentele[[i]][[j]]) %>%
+   pivot_longer(cols = everything(), 
+               names_to = c("taikinys", "rinkinys", "elementas", ".value"), 
+               names_sep= "_") %>% #mutate(ratio = log2(ratio)) %>%
+               mutate(p_status = if_else(pvalue < 0.05, "<0.05", ">0.05")) 
+}}
+num_keep <- 1:4
+linked_sample <- foreach(i = num_keep) %do% {
+Reduce(rbind, linked_sample[[i]]) 
+}
+
+
+full_dt <- Reduce(rbind, linked_sample)
+saveRDS(full_dt, outFile)
+}
+
+full_dt <- readRDS(outFile)
+full_dt <- full_dt %>% mutate(ratio = log2(ratio))
+full_dt$rinkinys <- factor(full_dt$rinkinys, 
+levels = c("1", "2", "3", "4"), 
+labels = pavadinimai)
+full_dt$taikinys <- factor(full_dt$taikinys, levels =c("hmC", "uCG", "uGC", "total"),
+ labels = c("hmCG", "uCG", "GC", "total"))
+full_dt <- full_dt %>% filter(taikinys != "total" & elementas != "Rpt")
+full_dt$elementas  <- factor(full_dt$elementas , levels = elementai,
+  labels = c("Promotorius", "CG sala", "Egzonas", "Intronas", "UTR3", "UTR5",
+    "Intergeninis", "SINE", "LINE"))
+
+
+#test <- full_dt %>% filter(taikinys == 'total' & rinkinys == 'lGC') %>% arrange(desc(ratio)) %>% 
+#  mutate(elementas = factor(elementas, unique(elementas))) 
+#lygiai = levels(test$elementas)
+#full_dt$elementas <- factor(full_dt$elementas, levels = lygiai)
+test <- full_dt %>% filter(taikinys == 'uCG' & rinkinys == 'gGCCG') %>% arrange(desc(ratio)) %>% 
+  mutate(elementas = factor(elementas, unique(elementas))) 
+lygiai = levels(test$elementas)
+full_dt$elementas <- factor(full_dt$elementas, levels = lygiai)
+gg1 <- ggplot(full_dt, aes(x = elementas, y = ratio, color = rinkinys))  + 
+geom_jitter(width = 0.2, size = 2.5) +  
+ facet_wrap(~taikinys, nrow = 1) + 
+  theme_bw() + geom_hline(yintercept = 0, lwd = 0.5, lty = 2, color = "blue") +
+  theme(
+        strip.text.x = element_text(size = 16),
+        legend.key.size = unit(3, 'cm'), 
+        legend.title = element_text(size= 18), 
+        legend.text = element_text(size=16),
+        axis.text.x = element_text(vjust= 1, hjust = 1, angle=45, face = "bold", size = 14),
+        axis.text.y = element_text(size = 14),
+        axis.title = element_text(size = 18),
+        title = element_text(size = 22),
+        legend.position = 'bottom') +
+  guides(colour = guide_legend(nrow = 1),
+         shape = guide_legend(nrow = 2)) +
+  scale_color_brewer(palette = "Dark2") + labs(
+    x = "",
+    y = "Logaritmuota santykinė praturtinimo vertė",
+    color = "Rinkinys",
+    title = ""
+  )
+
+full_dt <- readRDS(outFile)
+full_dt <- full_dt %>% mutate(ratio = log2(ratio))
+full_dt$rinkinys <- factor(full_dt$rinkinys, 
+levels = c("1", "2", "3", "4"), 
+labels = pavadinimai)
+full_dt$taikinys <- factor(full_dt$taikinys, levels =c("hmC", "uCG", "uGC", "total"),
+ labels = c("hmCG", "uCG", "GC", "total"))
+full_dt <- full_dt %>% filter(taikinys != "total" & elementas != "Rpt")
+full_dt$elementas  <- factor(full_dt$elementas , levels = elementai,
+  labels = c("Promotorius", "CG sala", "Egzonas", "Intronas", "UTR3", "UTR5",
+    "Intergeninis", "SINE", "LINE"))
+
+test <- full_dt %>% filter(taikinys == 'hmCG' & rinkinys == 'gGCCG') %>% arrange(desc(ratio)) %>% 
+  mutate(elementas = factor(elementas, unique(elementas))) 
+lygiai = levels(test$elementas)
+full_dt$elementas <- factor(full_dt$elementas, levels = lygiai)
+gg2 <- ggplot(full_dt, aes(x = elementas, y = ratio, color = rinkinys))  + 
+geom_jitter(width = 0.2, size = 2.5) +  
+ facet_wrap(~taikinys, nrow = 1) + 
+  theme_bw() + geom_hline(yintercept = 0, lwd = 0.5, lty = 2, color = "blue") +
+  theme(
+        strip.text.x = element_text(size = 16),
+        legend.key.size = unit(3, 'cm'), 
+        legend.title = element_text(size= 18), 
+        legend.text = element_text(size=16),
+        axis.text.x = element_text(vjust= 1, hjust = 1, angle=45, face = "bold", size = 14),
+        axis.text.y = element_text(size = 14),
+        axis.title = element_text(size = 18),
+        title = element_text(size = 22),
+        legend.position = 'bottom') +
+  guides(colour = guide_legend(nrow = 1),
+         shape = guide_legend(nrow = 2)) +
+  scale_color_brewer(palette = "Dark2") + labs(
+    x = "",
+    y = "Logaritmuota santykinė praturtinimo vertė",
+    color = "Rinkinys",
+    title = ""
+  )
+
+
+ggsave(filename = "output/code/prepdata/paveikslai/bakalauras/1_3_rinkiniai_regionu_praturtinimas1.png",
+                plot = gg1, width = 300, height = 180, units = "mm")
+ggsave(filename = "output/code/prepdata/paveikslai/bakalauras/1_3_rinkiniai_regionu_praturtinimas2.png",
+                plot = gg2, width = 300, height = 180, units = "mm")
+```
