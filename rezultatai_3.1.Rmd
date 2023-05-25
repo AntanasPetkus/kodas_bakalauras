@@ -1,0 +1,802 @@
+```{r setup}
+library(pacman)
+p_load(data.table, dplyr, ggplot2, foreach, 
+GenomicRanges, yaml, purrr, fs, stringr, tximport, edgeR, tidyr, ggseqlogo, corrplot,
+factoextra, ggstatsplot, tidyverse, ggpubr, GEOquery, rtracklayer, gridExtra, 
+rstatix, ggprism, rtracklayer, knitr, patchwork, ggcorrplot, Rsamtools, tidytext)
+outdatadir <- "output/code/prepdata/"
+grafikai <- "output/code/prepdata/grafikai/"
+options(scipen=999)
+knitr::opts_chunk$set(echo = TRUE, fig.width = 20, fig.height = 12)
+
+
+# Funkcijos 
+bin <- function(dt, bins = 500) {
+    dt <- dt %>% mutate(binID = paste0(seqnames,"_", floor(start/bins)))
+    return(dt)
+}
+
+regionbin <- function(dt) {
+  dt[, regionID := paste0(seqnames, "_", start,"_", end)]
+  return(dt)
+}
+
+give.n <- function(x){
+  return(c(y = median(x)*1.10, label = length(x))) }
+
+# Failai
+file_names <- fs::dir_ls("/mnt/store/DMTS/mESC_openChrom/regions/", regexp = "Final")
+#dtuCG <- readRDS("/mnt/store/DMTS/mESC_openChrom/regions/Cov_data_triple.RDS")
+#total <- dtuCG$total
+#saveRDS(total, "./input/total.RDS")
+#total <- total %>% as.data.table() %>% setnames("TT_S0", "TT_S0_deep") 
+pavadinimai <- c("lGC", "lGCCG", "gGC", "gGCCG")
+```
+
+# 3.1 Koreliacijos tarp metodų
+
+## Binai 
+
+```{r}
+outFile <- paste0(outdatadir, "mCG_uCG_bin.Rds")
+minimum <- c(0,5,10,15,20,25,30)
+bins <- c(100, 200, 500, 1000)
+methods <- c("fraction", "coverage", "density")
+if(!(file.exists(outFile))) {
+dtBis <- fread(paste0("/mnt/store/DMTS/mESC_openChrom/regions/GSM1372647_markdup_CpG.bedGraph"), skip = 1) %>%
+         setnames(c("seqnames", "start", "end", "m_level", "mCG", "uCG")) ## Bis4
+dtBis$seqnames <- factor(dtBis$seqnames)
+dtBis <- dtBis %>% mutate(start = start+1 , end = start)
+
+dtuCG <- readRDS("./input/uCG.RDS") %>% as.data.table()
+tmp1 <- inner_join(dtBis, dtuCG, by = c("seqnames", "start", "end"))  
+density <- readRDS("./input/densityuCG.Rds") %>% 
+  as.data.table() %>% select(seqnames, start, end, strand, TT_S0)
+dt <- full_join(density, dtuCG, by = c("seqnames", "start", "end", "strand"))
+dt <- dt %>% filter(TT_S0_deep > 0) 
+tmp1_1 <- full_join(dt,
+  dtBis, by = c("seqnames", "start", "end")) 
+tmp1_1[is.na(tmp1_1)] <- 0
+lentele <- foreach(j = bins) %do% {
+    print(j)
+        foreach(i = methods) %do% {
+    print(i)
+ if (i == "fraction") {
+       tmp2 <- tmp1 %>% ungroup() %>% bin(bins = j) %>% group_by(binID) %>% summarise(
+    sumCG = sum(TT_S0_deep >= 0),
+    mCG = sum(mCG) / sum(mCG + uCG),
+    uCG = sum(TT_S0_deep > 0) / sum(TT_S0_deep >= 0)) %>% 
+    setnames(c("binID", paste0(i, "_", j, "_sumCG"), 
+        paste0(i, "_", j, "_mCG"), paste0(i, "_", j, "_uCG")))
+    } else if (i == "coverage") {
+       tmp2 <- tmp1 %>% bin(bins = j) %>% group_by(binID) %>% summarise(
+    sumCG = sum(TT_S0_deep >= 0),
+    mCG = sum(mCG) / sum(mCG + uCG),
+    uCG = mean(TT_S0_deep)) %>% 
+    setnames(c("binID", paste0(i, "_", j, "_sumCG"), 
+        paste0(i, "_", j, "_mCG"), paste0(i, "_", j, "_uCG")))
+    } else if (i == "density") {
+       tmp2 <- tmp1_1 %>% bin(bins = j) %>% group_by(binID) %>% summarise(
+    sumCG = sum(TT_S0_deep >= 0),
+    mCG = sum(mCG) / sum(mCG + uCG),
+    uCG = mean(TT_S0)) %>% 
+    setnames(c("binID", paste0(i, "_", j, "_sumCG"), 
+        paste0(i, "_", j, "_mCG"), paste0(i, "_", j, "_uCG")))
+    } 
+}}
+
+num_keep <- 1:4
+linked_sample <- foreach(i = num_keep) %do% {
+Reduce(full_join, lentele[[i]])  %>%
+   pivot_longer(cols = -binID, names_to = c("metodas", "binas", ".value"), 
+               names_sep= "_") 
+}
+
+full_dt <- Reduce(rbind, linked_sample)
+full_dt <- full_dt[complete.cases(full_dt),]
+saveRDS(full_dt, outFile)
+}
+
+
+full_dt <- readRDS(outFile)
+fraction_dt <- full_dt %>% filter(metodas == "fraction")
+cor_dt <- foreach(i = bins, .combine = 'rbind') %do% {
+    filtered <- fraction_dt %>% filter(binas == i) 
+    value <- data.table(
+          "estimate" = cor.test(filtered$mCG, filtered$uCG, method = "spearman")$estimate,
+          "pvalue" = cor.test(filtered$mCG, filtered$uCG, method = "spearman")$p.value,
+          "binas" = paste0(i)) 
+}
+cor_dt$binas <- factor(cor_dt$binas, levels = bins)
+gg1 <- ggplot(cor_dt, aes(x = binas, y = -estimate)) + geom_col(fill = '#1b9e77') + 
+    theme_bw()
+
+coverage_dt <- full_dt %>% filter(metodas == "coverage")
+cor_dt <- foreach(i = bins, .combine = 'rbind') %do% {
+    filtered <- coverage_dt %>% filter(binas == i) 
+    value <- data.table(
+          "estimate" = cor.test(filtered$mCG, filtered$uCG, method = "spearman")$estimate,
+          "pvalue" = cor.test(filtered$mCG, filtered$uCG, method = "spearman")$p.value,
+          "binas" = paste0(i)) 
+}
+cor_dt$binas <- factor(cor_dt$binas, levels = bins)
+gg2 <- ggplot(cor_dt, aes(x = binas, y = -estimate)) + geom_col(fill = '#d95f02') + 
+    theme_bw()
+
+
+density_dt <- full_dt %>% filter(metodas == "density")
+cor_dt <- foreach(i = bins, .combine = 'rbind') %do% {
+    filtered <- density_dt %>% filter(binas == i) 
+    value <- data.table(
+          "estimate" = cor.test(filtered$mCG, filtered$uCG, method = "spearman")$estimate,
+          "pvalue" = cor.test(filtered$mCG, filtered$uCG, method = "spearman")$p.value,
+          "binas" = paste0(i)) 
+}
+cor_dt$binas <- factor(cor_dt$binas, levels = bins)
+gg3 <- ggplot(cor_dt, aes(x = binas, y = -estimate)) + geom_col(fill = '#7570b3') + 
+    theme_bw()
+
+
+p1 <- gg1 + scale_y_continuous(limits = c(0, 0.3)) + labs(title = "a", y = "Spearmano koreliacijos absoliuti vertė", x = "")
+p2 <- gg2 + scale_y_continuous(limits = c(0, 0.3)) + labs(title = "b", x = "Lango (bino) dydis", y ="")
+p3 <- gg3 + scale_y_continuous(limits = c(0, 0.3)) + labs(title = "c", x = "", y = "")
+
+p0 <- ggarrange(p1, p2, p3, nrow = 1, common.legend = TRUE)
+
+ggsave(filename = "output/code/prepdata/paveikslai/bakalauras_bonus/3_1_WGBS_binu_koreliacija.png",
+                plot = p0, width = 420, height = 210, units = "mm")
+```
+
+## Regionai
+
+```{r}
+## Koreliacijos skirtumai tarp grupių
+outFile <- paste0(outdatadir, "lentele_corellations_fraction.Rds")
+if(!(file.exists(outFile))) {
+dtBis <- fread(paste0("/mnt/store/DMTS/mESC_openChrom/regions/GSM1372647_markdup_CpG.bedGraph"), skip = 1) %>%
+         setnames(c("seqnames", "start", "end", "m_level", "mCG", "uCG")) ## Bis4
+dtBis$seqnames <- factor(dtBis$seqnames)
+dtBis <- dtBis %>% mutate(start = start+1 , end = start)
+sets <- c(1:4)
+tmp1 <- dtBis %>% makeGRangesFromDataFrame(keep.extra.columns = TRUE)
+lentele <- foreach(i = sets) %do% {
+  print(i)
+dt <- readRDS(file_names[i]) 
+tmp2 <- dt[[1]] %>% as.data.table() %>% 
+  select(seqnames, start, end, width, strand, uCG, group_poster, nCG, hmC, width, uCG_fraction) %>%
+  rename(uCG = "uCG_n") %>%
+  makeGRangesFromDataFrame(keep.extra.columns = TRUE) 
+ov <- findOverlaps(tmp2, tmp1) 
+tmp2_matched <- tmp2[queryHits(ov)]
+mcols(tmp2_matched) <- cbind.data.frame(
+    mcols(tmp2_matched),
+    mcols(tmp1[subjectHits(ov)]))
+tmp3 <- as.data.table(tmp2_matched) %>% regionbin() %>%
+        group_by(regionID, group_poster) %>%  summarise(
+          mCG = sum(mCG) / sum(mCG + uCG),
+          uCG = mean(uCG_fraction),
+          uCGsk = mean(uCG_n),
+          nCG = mean(nCG),
+          hmCsk = mean(hmC),
+          width = mean(width)) %>%
+      setnames(c("regionID", "group_poster", paste0(i, "_mCG"), paste0(i, "_uCG"),
+                             paste0(i, "_uCGsk"), paste0(i, "_nCG"), 
+                             paste0(i, "_hmCsk"), paste0(i, "_width"))) 
+}
+
+
+full_dt <- Reduce(full_join, lentele) %>%
+ pivot_longer(cols = -c("regionID", "group_poster"), 
+ names_to = c("rinkinys", ".value"), names_sep = "_")
+full_dt <- full_dt[complete.cases(full_dt),]
+saveRDS(full_dt, outFile)
+}
+
+outFile <- paste0(outdatadir, "lentele_corellations_coverage.Rds")
+if(!(file.exists(outFile))) {
+dtBis <- fread(paste0("./input/GSM1027571_R1.trimmed.P_bismark_hisat2_pe.deduplicated.bismark.cov.gz")) %>%
+         setnames(c("seqnames", "start", "end", "m_level", "mCG", "uCG"))
+### ARBA
+dtBis <- fread(paste0("/mnt/store/DMTS/mESC_openChrom/regions/GSM1372647_markdup_CpG.bedGraph"), skip = 1) %>%
+         setnames(c("seqnames", "start", "end", "m_level", "mCG", "uCG")) ## Bis4
+dtBis$seqnames <- factor(dtBis$seqnames)
+dtBis <- dtBis %>% mutate(start = start+1 , end = start)
+###
+sets <- c(1:4)
+min <- c(0, 5, 10, 15, 20, 25, 30, 35, 40)
+dtuCG <- readRDS("./input/uCG.RDS") %>% as.data.table()
+sets <- c(1:4)
+tmp1 <- dtuCG %>% select(seqnames, start, end, TT_S0_deep) %>%
+full_join(.,
+  dtBis, by = c("seqnames", "start", "end")) 
+tmp1[is.na(tmp1)] <- 0
+tmp1 <- tmp1 %>%  
+  makeGRangesFromDataFrame(keep.extra.columns = TRUE)
+lentele <- foreach(i = sets) %do% {
+  print(i)
+dt <- readRDS(file_names[i]) 
+tmp2 <- dt[[1]] %>% as.data.table() %>% 
+  select(seqnames, start, end, width, strand, uCG, group_poster, nCG, hmC, width, uCG_fraction) %>%
+  rename(uCG = "uCG_n") %>%
+  makeGRangesFromDataFrame(keep.extra.columns = TRUE) 
+ov <- findOverlaps(tmp2, tmp1) 
+tmp2_matched <- tmp2[queryHits(ov)]
+mcols(tmp2_matched) <- cbind.data.frame(
+    mcols(tmp2_matched),
+    mcols(tmp1[subjectHits(ov)]))
+tmp3 <- as.data.table(tmp2_matched) %>% regionbin() %>%
+        group_by(regionID, group_poster) %>%  summarise(
+          mCG = sum(mCG) / sum(mCG + uCG),
+          uCG = mean(uCG_fraction),
+          uCGsk = mean(uCG_n),
+          nCG = mean(nCG),
+          hmCsk = mean(hmC),
+          width = mean(width),
+          coverage = mean(TT_S0_deep)) %>%
+      setnames(c("regionID", "group_poster", paste0(i, "_mCG"), paste0(i, "_uCG"),
+                             paste0(i, "_uCGsk"), paste0(i, "_nCG"), 
+                             paste0(i, "_hmCsk"), paste0(i, "_width"), 
+                             paste0(i, "_coverage"))) 
+}
+
+
+full_dt <- Reduce(full_join, lentele) %>%
+ pivot_longer(cols = -c("regionID", "group_poster"), 
+ names_to = c("rinkinys", ".value"), names_sep = "_")
+full_dt <- full_dt[complete.cases(full_dt),]
+saveRDS(full_dt, outFile)
+}
+
+outFile <- paste0(outdatadir, "lentele_corellations_density.Rds")
+if(!(file.exists(outFile))) {
+dtBis <- fread(paste0("/mnt/store/DMTS/mESC_openChrom/regions/GSM1372647_markdup_CpG.bedGraph"), skip = 1) %>%
+         setnames(c("seqnames", "start", "end", "m_level", "mCG", "uCG")) ## Bis4
+dtBis$seqnames <- factor(dtBis$seqnames)
+dtBis <- dtBis %>% mutate(start = start+1 , end = start)
+###
+sets <- c(1:4)
+min <- c(0, 5, 10, 15, 20, 25, 30, 35, 40)
+density <- readRDS("./input/densityuCG.Rds") %>% 
+  as.data.table() %>% select(seqnames, start, end, strand, TT_S0)
+dtuCG <- readRDS("./input/uCG.RDS") %>% as.data.table()
+dt <- full_join(density, dtuCG, by = c("seqnames", "start", "end", "strand"))
+dt <- dt %>% filter(TT_S0_deep > 0) %>% select(seqnames, start, end, TT_S0)
+sets <- c(1:4)
+tmp1 <- full_join(dt,
+  dtBis, by = c("seqnames", "start", "end")) 
+tmp1[is.na(tmp1)] <- 0
+tmp1 <- tmp1 %>%  
+  makeGRangesFromDataFrame(keep.extra.columns = TRUE)
+lentele <- foreach(i = sets) %do% {
+  print(i)
+dt <- readRDS(file_names[i]) 
+tmp2 <- dt[[1]] %>% as.data.table() %>% 
+  select(seqnames, start, end, width, strand, uCG, group_poster, nCG, hmC, width, uCG_fraction) %>%
+  rename(uCG = "uCG_n") %>%
+  makeGRangesFromDataFrame(keep.extra.columns = TRUE) 
+ov <- findOverlaps(tmp2, tmp1) 
+tmp2_matched <- tmp2[queryHits(ov)]
+mcols(tmp2_matched) <- cbind.data.frame(
+    mcols(tmp2_matched),
+    mcols(tmp1[subjectHits(ov)]))
+tmp3 <- as.data.table(tmp2_matched) %>% regionbin() %>%
+        group_by(regionID, group_poster) %>%  summarise(
+          mCG = sum(mCG) / sum(mCG + uCG),
+          uCG = mean(uCG_fraction),
+          uCGsk = mean(uCG_n),
+          nCG = mean(nCG),
+          hmCsk = mean(hmC),
+          width = mean(width),
+          density = mean(TT_S0)) %>%
+      setnames(c("regionID", "group_poster", paste0(i, "_mCG"), paste0(i, "_uCG"),
+                             paste0(i, "_uCGsk"), paste0(i, "_nCG"), 
+                             paste0(i, "_hmCsk"), paste0(i, "_width"), 
+                             paste0(i, "_density"))) 
+}
+
+
+full_dt <- Reduce(full_join, lentele) %>%
+ pivot_longer(cols = -c("regionID", "group_poster"), 
+ names_to = c("rinkinys", ".value"), names_sep = "_")
+full_dt <- full_dt[complete.cases(full_dt),]
+saveRDS(full_dt, outFile)
+}
+
+### Kiek duomenų prarandama pašalinus 5 arba mažiau turinčius regionus
+
+dt <- readRDS(paste0(outdatadir, "lentele_corellations_fraction.Rds"))
+frakcija = 1 - (dt %>% filter(nCG > 5) %>% nrow()) / (dt  %>% nrow())
+
+print(paste0("Išsaugoma ", round(frakcija*100,2), "% duomenų"))
+###
+
+#### FRACTION
+outFile <- paste0(outdatadir, "cor_lentele_fraction.Rds")
+rinkiniai <- c(1:4)
+minimum <-c(0, 5, 10, 15, 20, 30, 40)
+if(!(file.exists(outFile))) {
+full_dt <- readRDS(paste0(outdatadir, "lentele_corellations_fraction.Rds"))
+lentele <-  foreach(j = rinkiniai) %do% {
+      foreach(z = minimum) %do% {
+        tmp1 <- full_dt %>% filter(rinkinys == j & nCG > z) 
+        value <- data.table(
+          "estimate" = cor.test(tmp1$mCG, tmp1$uCG, method = "spearman")$estimate,
+          "pvalue" = cor.test(tmp1$mCG, tmp1$uCG, method = "spearman")$p.value) %>% 
+          setnames(c(paste0(j, "_", z, "_estimate"), paste0(j, "_", z,"_pvalue")))
+      }
+    }
+num_keep <- 1:4
+linked_sample <- foreach(i = num_keep) %do% {
+Reduce(cbind, lentele[[i]])  %>%
+   pivot_longer(cols = everything(), names_to = c("rinkinys", "minimum", ".value"), 
+               names_sep= "_") 
+}
+full_dt <- Reduce(rbind, linked_sample)
+full_dt <- full_dt[complete.cases(full_dt),]
+saveRDS(full_dt, outFile)
+}
+
+full_dt <- readRDS(outFile)
+
+
+full_dt$rinkinys <- factor(full_dt$rinkinys, 
+  levels = c("1", "2", "3", "4"), 
+  labels = pavadinimai)
+full_dt$minimum <- factor(full_dt$minimum, 
+  levels = minimum)
+
+gg1 <- ggplot(full_dt, aes(x = minimum, y = abs(estimate), fill = rinkinys)) + 
+ geom_col(position = 'dodge', color = 'black') + theme_bw() + scale_fill_brewer(palette = "Dark2") +
+ facet_grid(cols = vars(rinkinys)) + 
+ scale_y_continuous(limits =c(0, 0.7)) +
+ labs(
+  y = "Spearmano koreliacijos absoliuti vertė",
+  x = "",
+  fill = "Duomenų rinkinys",
+  title = "a"
+ ) + theme(
+        strip.text.x = element_text(size = 16),
+        axis.text.x = element_text(size = 12, angle = 90, face = 'bold'),
+        axis.text.y = element_text(size = 14),
+        axis.title = element_text(size = 18),
+        title = element_text(size = 22),
+        legend.key.size = unit(1, 'cm'), 
+        legend.title = element_text(size= 18), 
+        legend.text = element_text(size=16)) 
+
+
+nulis <- full_dt %>% filter(minimum == "0") %>% .$estimate
+penki <- full_dt %>% filter(minimum == "5") %>% .$estimate
+
+print(paste0("iš minimum 0 į minimum 5 koreliacijos vertė padidėja: ", round(mean(penki / nulis), 2)))
+
+######## COVERAGE
+outFile <- paste0(outdatadir, "cor_lentele_coverage.Rds")
+rinkiniai <- c(1:4)
+minimum <-c(0, 5, 10, 15, 20, 30, 40)
+if(!(file.exists(outFile))) {
+        full_dt <- readRDS(paste0(outdatadir, "lentele_corellations_coverage.Rds"))
+lentele <-  foreach(j = rinkiniai) %do% {
+      foreach(z = minimum) %do% {
+        tmp1 <- full_dt %>% filter(rinkinys == j & nCG > z) 
+        value <- data.table(
+          "estimate" = cor.test(tmp1$mCG, tmp1$coverage, method = "spearman")$estimate,
+          "pvalue" = cor.test(tmp1$mCG, tmp1$coverage, method = "spearman")$p.value) %>% 
+          setnames(c(paste0(j, "_", z, "_estimate"), paste0(j, "_", z,"_pvalue")))
+      }
+    }
+num_keep <- 1:4
+linked_sample <- foreach(i = num_keep) %do% {
+Reduce(cbind, lentele[[i]])  %>%
+   pivot_longer(cols = everything(), names_to = c("rinkinys", "minimum", ".value"), 
+               names_sep= "_") 
+}
+
+full_dt <- Reduce(rbind, linked_sample)
+full_dt <- full_dt[complete.cases(full_dt),]
+saveRDS(full_dt, outFile)
+}
+
+full_dt <- readRDS(outFile)
+
+
+full_dt$rinkinys <- factor(full_dt$rinkinys, 
+  levels = c("1", "2", "3", "4"), 
+  labels = pavadinimai)
+full_dt$minimum <- factor(full_dt$minimum, 
+  levels = minimum)
+
+gg2 <- ggplot(full_dt, aes(x = minimum, y = abs(estimate), fill = rinkinys)) + 
+ geom_col(position = 'dodge', color = 'black') + theme_bw() + scale_fill_brewer(palette = "Dark2") +
+ facet_grid(cols = vars(rinkinys)) + 
+ scale_y_continuous(limits =c(0, 0.7)) +
+ labs(
+  y = "",
+  x = "Minimali filtravimo vertė",
+  fill = "Duomenų rinkinys",
+  title = "b"
+ ) + theme(
+        strip.text.x = element_text(size = 16),
+        axis.text.x = element_text(size = 12, angle = 90, face = 'bold'),
+        axis.text.y = element_text(size = 14),
+        axis.title = element_text(size = 18),
+        title = element_text(size = 22),
+        legend.key.size = unit(1, 'cm'), 
+        legend.title = element_text(size= 18), 
+        legend.text = element_text(size=16)) 
+
+
+nulis <- full_dt %>% filter(minimum == "0") %>% .$estimate
+penki <- full_dt %>% filter(minimum == "5") %>% .$estimate
+
+print(paste0("iš minimum 0 į minimum 5 koreliacijos vertė padidėja: ", round(mean(penki / nulis), 2)))
+
+######## DENSITY
+outFile <- paste0(outdatadir, "cor_lentele_density.Rds")
+rinkiniai <- c(1:4)
+minimum <-c(0, 5, 10, 15, 20, 30, 40)
+if(!(file.exists(outFile))) {
+        full_dt <- readRDS(paste0(outdatadir, "lentele_corellations_density.Rds"))
+lentele <-  foreach(j = rinkiniai) %do% {
+      foreach(z = minimum) %do% {
+        tmp1 <- full_dt %>% filter(rinkinys == j & nCG > z) 
+        value <- data.table(
+          "estimate" = cor.test(tmp1$mCG, tmp1$density, method = "spearman")$estimate,
+          "pvalue" = cor.test(tmp1$mCG, tmp1$density, method = "spearman")$p.value) %>% 
+          setnames(c(paste0(j, "_", z, "_estimate"), paste0(j, "_", z,"_pvalue")))
+      }
+    }
+num_keep <- 1:4
+linked_sample <- foreach(i = num_keep) %do% {
+Reduce(cbind, lentele[[i]])  %>%
+   pivot_longer(cols = everything(), names_to = c("rinkinys", "minimum", ".value"), 
+               names_sep= "_") 
+}
+
+full_dt <- Reduce(rbind, linked_sample)
+full_dt <- full_dt[complete.cases(full_dt),]
+saveRDS(full_dt, outFile)
+}
+
+full_dt <- readRDS(outFile)
+
+
+full_dt$rinkinys <- factor(full_dt$rinkinys, 
+  levels = c("1", "2", "3", "4"), 
+  labels =pavadinimai)
+full_dt$minimum <- factor(full_dt$minimum, 
+  levels = minimum)
+
+gg3 <- ggplot(full_dt, aes(x = minimum, y = abs(estimate), fill = rinkinys)) + 
+ geom_col(position = 'dodge', color = 'black') + theme_bw() + scale_fill_brewer(palette = "Dark2") +
+ facet_grid(cols = vars(rinkinys)) + 
+ scale_y_continuous(limits =c(0, 0.7)) +
+ labs(
+  y = "",
+  x = "",
+  fill = "Duomenų rinkinys",
+  title = "c"
+ ) + theme(
+        strip.text.x = element_text(size = 16),
+        axis.text.x = element_text(size = 12, angle = 90, face = 'bold'),
+        axis.text.y = element_text(size = 14),
+        axis.title = element_text(size = 18),
+        title = element_text(size = 22),
+        legend.key.size = unit(1, 'cm'), 
+        legend.title = element_text(size= 18), 
+        legend.text = element_text(size=16)) 
+
+
+nulis <- full_dt %>% filter(minimum == "0") %>% .$estimate
+penki <- full_dt %>% filter(minimum == "5") %>% .$estimate
+
+print(paste0("iš minimum 0 į minimum 5 koreliacijos vertė padidėja: ", round(mean(penki / nulis), 2)))
+
+
+
+p <- ggarrange(gg1, gg2, gg3, nrow = 1, common.legend = TRUE)
+
+
+
+ggsave(filename = "output/code/prepdata/paveikslai/bakalauras/3_1_WGBS_koreliacijos.png",
+                plot = p, width = 420, height = 210, units = "mm")
+```
+
+
+# 3.2 Skaiciavimo metodai
+
+```{r}
+outFile <- paste0(outdatadir, "skaiciavimo_budai_fraction.Rds")
+if(!(file.exists(outFile))) {
+dtBis <- fread(paste0("/mnt/store/DMTS/mESC_openChrom/regions/GSM1372647_markdup_CpG.bedGraph"), skip = 1) %>%
+         setnames(c("seqnames", "start", "end", "m_level", "mCG", "uCG")) ## Bis4
+dtBis$seqnames <- factor(dtBis$seqnames)
+tmp1 <- dtBis %>%  
+  makeGRangesFromDataFrame(keep.extra.columns = TRUE)
+lentele <- foreach(i = sets) %do% {
+  print(i)
+dt <- readRDS(file_names[i]) 
+tmp2 <- dt[[1]] %>% as.data.table() %>% filter(nCG > 5) %>% 
+  select(seqnames, start, end, width, strand, uCG_fraction) %>%
+  makeGRangesFromDataFrame(keep.extra.columns = TRUE)
+ov <- findOverlaps(tmp2, tmp1) 
+tmp2_matched <- tmp2[queryHits(ov)]
+mcols(tmp2_matched) <- cbind.data.frame(
+    mcols(tmp2_matched),
+    mcols(tmp1[subjectHits(ov)]))
+tmp3 <- tmp2_matched %>% as.data.table() %>% regionbin() 
+tmp4 <- tmp3 %>% group_by(regionID) %>% 
+          summarise(
+          coveragemean = mean(uCG_fraction),
+          fractionmCG = sum(mCG) / sum(mCG + uCG))  %>%
+      setnames(c("regionID", paste0(i, "_uCG"), 
+                             paste0(i, "_mCG")))   
+}
+full_dt <- Reduce(full_join, lentele)  %>%
+   pivot_longer(-regionID, names_to = c("rinkinys", ".value"), 
+               names_sep= "_")  
+full_dt <- full_dt[complete.cases(full_dt),]
+saveRDS(full_dt, outFile)
+}
+
+full_dt <- readRDS(outFile)
+
+full_dt <- full_dt %>% 
+  mutate(regionas = cut(uCG, breaks=c(0, 0.2, 0.4, 0.6, 0.8, max(uCG)), include.lowest=TRUE))
+full_dt$rinkinys <- factor(full_dt$rinkinys, 
+levels = c("1", "2", "3", "4"), 
+labels = pavadinimai)
+
+full_dt %>% group_by(rinkinys, regionas) %>% summarise(mediana = median(mCG)) 
+full_dt %>% filter(regionas == "(0.8,1]") %>% group_by(rinkinys) %>% 
+  summarise(meadianauCG = median(uCG), medianamCG = median(mCG))
+outFile <- paste0(outdatadir, "pvalue_fraction_wilcoxNEW.Rds")
+if(!(file.exists(outFile))) {
+df_p_val_1 <- full_dt %>% 
+  rstatix::group_by(rinkinys) %>% 
+  rstatix:: wilcox_test(mCG~regionas) %>% 
+  rstatix::add_xy_position()
+saveRDS(df_p_val_1, outFile)
+}
+df_p_val_1 <- readRDS(outFile)
+
+kombinacijos <- c("[0,0.2]_(0.2,0.4]", "(0.2,0.4]_(0.4,0.6]", "(0.4,0.6]_(0.6,0.8]", "(0.6,0.8]_(0.8,1]") 
+pvalues_1 <- df_p_val_1 %>% unite(col = "group", group1, group2, sep = "_") %>%
+    filter(group %in% kombinacijos) %>% separate(col = group, into = c("group1", "group2"), sep = "_")
+
+gg1 <- ggplot(full_dt, aes(y = mCG, x = regionas, fill = rinkinys)) + 
+  geom_boxplot(outlier.shape = NA) + theme_bw() +
+  scale_fill_brewer(palette = "Dark2") +
+  facet_wrap(~rinkinys, ncol = 4) +
+  labs(
+    y = "Vidutinis metilinimas regione",
+    x = "uCG frakcijos intervalas",
+    fill = "Rinkinys",
+    title = "a") + 
+  theme(
+        strip.text.x = element_text(size = 16),
+        axis.text.x = element_text(size = 12, angle = 90, face = 'bold'),
+        axis.text.y = element_text(size = 14),
+        axis.title = element_text(size = 18),
+        title = element_text(size = 22),
+        legend.key.size = unit(1, 'cm'), 
+        legend.title = element_text(size= 18), 
+        legend.text = element_text(size=16)) # +
+ #stat_summary(fun.data = give.n, geom = "text", fun.y = median,
+ #                 position = position_dodge(width = 0.75), 
+ #                 angle = 90, size = 5, fontface = "bold")
+pvalues_1$p.adj.signif <- gsub("****", "***", pvalues_1$p.adj.signif, fixed = TRUE)
+gg1 <- gg1 + add_pvalue(pvalues_1, label = "p.adj.signif",  
+                     #colour = "blue", # label
+                     label.size = 3,  # label
+                     remove.bracket = TRUE,
+                     tip.length = 0,
+                     y = 1, 
+                     angle = 45
+                     )
+
+
+## Coverage
+outFile <- paste0(outdatadir, "skaiciavimo_budai_coverage.Rds")
+if(!(file.exists(outFile))) {
+dtBis <- fread(paste0("/mnt/store/DMTS/mESC_openChrom/regions/GSM1372647_markdup_CpG.bedGraph"), skip = 1) %>%
+         setnames(c("seqnames", "start", "end", "m_level", "mCG", "uCG")) ## Bis4
+dtBis$seqnames <- factor(dtBis$seqnames)
+dtBis <- dtBis %>% mutate(start = start+1 , end = start)
+dtuCG <- readRDS("./input/uCG.RDS") %>% as.data.table()
+sets <- c(1:4)
+tmp1 <- dtuCG %>% select(seqnames, start, end, TT_S0_deep) %>%
+full_join(.,
+  dtBis, by = c("seqnames", "start", "end")) 
+tmp1[is.na(tmp1)] <- 0
+tmp1 <- tmp1 %>%  
+  makeGRangesFromDataFrame(keep.extra.columns = TRUE)
+lentele <- foreach(i = sets) %do% {
+  print(i)
+dt <- readRDS(file_names[i]) 
+tmp2 <- dt[[1]] %>% as.data.table() %>% filter(nCG > 5) %>% 
+  select(seqnames, start, end, width, strand) %>%
+  makeGRangesFromDataFrame(keep.extra.columns = TRUE)
+ov <- findOverlaps(tmp2, tmp1) 
+tmp2_matched <- tmp2[queryHits(ov)]
+mcols(tmp2_matched) <- cbind.data.frame(
+    mcols(tmp2_matched),
+    mcols(tmp1[subjectHits(ov)]))
+tmp3 <- tmp2_matched %>% as.data.table() %>% regionbin() 
+tmp4 <- tmp3 %>% group_by(regionID) %>% 
+          summarise(
+          coveragemean = mean(TT_S0_deep),
+          fractionmCG = sum(mCG) / sum(mCG + uCG))  %>%
+      setnames(c("regionID", paste0(i, "_uCG"), 
+                             paste0(i, "_mCG")))   
+}
+
+
+full_dt <- Reduce(full_join, lentele)  %>%
+   pivot_longer(-regionID, names_to = c("rinkinys", ".value"), 
+               names_sep= "_")  
+full_dt <- full_dt[complete.cases(full_dt),]
+saveRDS(full_dt, outFile)
+}
+
+full_dt <- readRDS(outFile)
+full_dt <- full_dt %>% 
+  mutate(regionas = cut(uCG, breaks=c(0, 0.5, 1, 1.5, 2, 2.5, max(uCG)), include.lowest=TRUE))
+full_dt$rinkinys <- factor(full_dt$rinkinys, 
+levels = c("1", "2", "3", "4"), 
+labels = pavadinimai)
+
+full_dt %>% group_by(rinkinys, regionas) %>% summarise(mediana = median(mCG)) %>% filter(regionas == "(2.5,38.7]")
+#outFile <- paste0(outdatadir, "pvalue_coverage_wilcox_2.Rds")
+outFile <- paste0(outdatadir, "pvalue_coverage_wilcoxNEW.Rds")
+if(!(file.exists(outFile))) {
+df_p_val_2 <- full_dt %>% 
+  rstatix::group_by(rinkinys) %>% 
+  rstatix:: wilcox_test(mCG~regionas) %>% 
+  rstatix::add_xy_position()
+saveRDS(df_p_val_2, outFile)
+}
+df_p_val_2 <- readRDS(outFile)
+
+kombinacijos <- c("[0,0.5]_(0.5,1]", "(0.5,1]_(1,1.5]", "(1,1.5]_(1.5,2]", "(1.5,2]_(2,2.5]", "(2,2.5]_(2.5,38.7]")
+pvalues_2 <- df_p_val_2 %>% unite(col = "group", group1, group2, sep = "_") %>%
+    filter(group %in% kombinacijos) %>% separate(col = group, into = c("group1", "group2"), sep = "_")
+
+gg2 <- ggplot(full_dt, aes(y = mCG, x = regionas, fill = rinkinys)) + 
+  geom_boxplot(outlier.shape = NA) + theme_bw() +
+  scale_fill_brewer(palette = "Dark2") +
+  facet_wrap(~rinkinys, nrow = 1, scales = 'free_x') +
+  labs(
+    y = "",
+    x = "Vidutinio uCG padengimo intervalas",
+    fill = "Rinkinys",
+    title = "b") + 
+   theme(
+        strip.text.x = element_text(size = 16),
+        axis.text.x = element_text(size = 12, angle = 90, face = 'bold'),
+        axis.text.y = element_text(size = 14),
+        axis.title = element_text(size = 18),
+        title = element_text(size = 22),
+        legend.key.size = unit(1, 'cm'), 
+        legend.title = element_text(size= 18), 
+        legend.text = element_text(size=16))
+ #stat_summary(fun.data = give.n, geom = "text", fun.y = median,
+ #                 position = position_dodge(width = 0.75), 
+ #                 angle = 90, size = 5, fontface = "bold")
+pvalues_2$p.adj.signif <- gsub("****", "***", pvalues_2$p.adj.signif, fixed = TRUE)
+gg2 <- gg2 + add_pvalue(pvalues_2, label = "p.adj.signif",  
+                     #colour = "blue", # label
+                     label.size = 3,  # label
+                     remove.bracket = TRUE,
+                     tip.length = 0,
+                     y = 1, 
+                     angle = 45
+                     )
+
+#Density
+outFile <- paste0(outdatadir, "skaiciavimo_budai_density.Rds")
+if(!(file.exists(outFile))) {
+dtBis <- fread(paste0("/mnt/store/DMTS/mESC_openChrom/regions/GSM1372647_markdup_CpG.bedGraph"), skip = 1) %>%
+         setnames(c("seqnames", "start", "end", "m_level", "mCG", "uCG")) ## Bis4
+dtBis$seqnames <- factor(dtBis$seqnames)
+dtBis <- dtBis %>% mutate(start = start+1 , end = start)
+####
+tmp1 <- dtBis %>% makeGRangesFromDataFrame(keep.extra.columns = TRUE)
+density <- readRDS("./input/densityuCG.Rds") %>% 
+  as.data.table() %>% select(seqnames, start, end, strand, TT_S0)
+dtuCG <- readRDS("./input/uCG.RDS") %>% as.data.table()
+dt <- full_join(density, dtuCG, by = c("seqnames", "start", "end", "strand"))
+dt <- dt %>% filter(TT_S0_deep > 0) %>% select(seqnames, start, end, TT_S0)
+sets <- c(1:4)
+tmp1 <- full_join(dt,
+  dtBis, by = c("seqnames", "start", "end")) 
+tmp1[is.na(tmp1)] <- 0
+tmp1 <- tmp1 %>%  
+  makeGRangesFromDataFrame(keep.extra.columns = TRUE)
+lentele <- foreach(i = sets) %do% {
+  print(i)
+dt <- readRDS(file_names[i]) 
+tmp2 <- dt[[1]] %>% as.data.table() %>% filter(nCG > 5) %>% 
+  select(seqnames, start, end, width, strand) %>%
+  makeGRangesFromDataFrame(keep.extra.columns = TRUE) 
+ov <- findOverlaps(tmp2, tmp1) 
+tmp2_matched <- tmp2[queryHits(ov)]
+mcols(tmp2_matched) <- cbind.data.frame(
+    mcols(tmp2_matched),
+    mcols(tmp1[subjectHits(ov)]))
+tmp3 <- tmp2_matched %>% as.data.table() %>% regionbin() 
+tmp4 <- tmp3 %>% group_by(regionID) %>% 
+          summarise(
+          densitymean = mean(TT_S0),
+          fractionmCG = sum(mCG) / sum(mCG + uCG))  %>%
+      setnames(c("regionID", paste0(i, "_uCG"), 
+                             paste0(i, "_mCG")))  
+}
+full_dt <- Reduce(full_join, lentele)  %>%
+   pivot_longer(-regionID, names_to = c("rinkinys", ".value"), 
+               names_sep= "_")  
+full_dt <- full_dt[complete.cases(full_dt),]
+saveRDS(full_dt, outFile)
+}
+
+
+full_dt <- readRDS(outFile)
+full_dt <- full_dt %>% 
+  mutate(regionas = cut(uCG, 
+  breaks=c(0, 0.5, 1, 1.5, 2, 3, 4, max(uCG)), include.lowest=TRUE))
+
+full_dt$rinkinys <- factor(full_dt$rinkinys, 
+levels = c("1", "2", "3", "4"), 
+labels =pavadinimai)
+full_dt %>% group_by(rinkinys, regionas) %>% summarise(mediana = median(mCG)) %>% filter(regionas == "(4,54.6]")
+
+outFile <- paste0(outdatadir, "pvalue_density_wilcoxNEW.Rds")
+if(!(file.exists(outFile))) {
+df_p_val_3 <- full_dt %>% 
+  rstatix::group_by(rinkinys) %>% 
+  rstatix:: wilcox_test(mCG~regionas) %>% 
+  rstatix::add_xy_position()
+saveRDS(df_p_val_3, outFile)
+}
+df_p_val_3 <- readRDS(outFile)
+
+
+kombinacijos <- c("[0,0.5]_(0.5,1]", "(0.5,1]_(1,1.5]", "(1,1.5]_(1.5,2]", "(1.5,2]_(2,3]", "(2,3]_(3,4]", "(3,4]_(4,54.6]")
+pvalues_3 <- df_p_val_3 %>% unite(col = "group", group1, group2, sep = "_") %>%
+    filter(group %in% kombinacijos) %>% separate(col = group, into = c("group1", "group2"), sep = "_")
+
+gg3 <- ggplot(full_dt, aes(y = mCG, x = regionas, fill = rinkinys)) + 
+  geom_boxplot(outlier.shape = NA) + theme_bw() +
+  scale_fill_brewer(palette = "Dark2") +
+  facet_wrap(~rinkinys, nrow = 1, scales = 'free_x') +
+   theme(
+        strip.text.x = element_text(size = 16),
+        axis.text.x = element_text(size = 12, angle = 90, face = 'bold'),
+        axis.text.y = element_text(size = 14),
+        axis.title = element_text(size = 18),
+        title = element_text(size = 22),
+        legend.key.size = unit(1, 'cm'), 
+        legend.title = element_text(size= 18), 
+        legend.text = element_text(size=16)) +
+  labs(
+    y = "",
+    x = "Vidutinio uCG tankio intervalas",
+    fill = "Rinkinys",
+    title = "c") #+ 
+ #stat_summary(fun.data = give.n, geom = "text", fun.y = median,
+ #                 position = position_dodge(width = 0.75), 
+
+pvalues_3$p.adj.signif <- gsub("****", "***", pvalues_3$p.adj.signif, fixed = TRUE)
+gg3 <- gg3 + add_pvalue(pvalues_3, label = "p.adj.signif",  
+                     #colour = "blue", # label
+                     label.size = 3,  # label
+                     remove.bracket = TRUE,
+                     tip.length = 0,
+                     y = 1
+                     )
+
+p0 <- ggarrange(gg1, gg2, gg3, nrow = 1, common.legend = TRUE)
+
+ggsave(filename = "output/code/prepdata/paveikslai/bakalauras/3_2_WGBS_uCG_skaiciavimo_budai.png",
+                plot = p0, width = 420, height = 210, units = "mm")
+```
