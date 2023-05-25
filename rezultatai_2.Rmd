@@ -1,0 +1,696 @@
+```{r setup}
+library(pacman)
+p_load(data.table, dplyr, ggplot2, foreach, 
+GenomicRanges, yaml, purrr, fs, stringr, tximport, edgeR, tidyr, ggseqlogo, corrplot,
+factoextra, ggstatsplot, tidyverse, ggpubr, GEOquery, rtracklayer, gridExtra, 
+rstatix, ggprism, rtracklayer, knitr, patchwork, ggcorrplot, Rsamtools, tidytext)
+outdatadir <- "output/code/prepdata/"
+grafikai <- "output/code/prepdata/grafikai/"
+options(scipen=999)
+knitr::opts_chunk$set(echo = TRUE, fig.width = 20, fig.height = 12)
+
+
+# Funkcijos 
+bin <- function(dt, bins = 100) {
+    dt[, binID := paste0(seqnames,"_", floor(start/bins))]
+    return(dt)
+}
+
+regionbin <- function(dt) {
+  dt[, regionID := paste0(seqnames, "_", start,"_", end)]
+  return(dt)
+}
+
+give.n <- function(x){
+  return(c(y = median(x)*1.10, label = length(x))) }
+
+# Failai
+file_names <- fs::dir_ls("/mnt/store/DMTS/mESC_openChrom/regions/", regexp = "Final")
+#dtuCG <- readRDS("/mnt/store/DMTS/mESC_openChrom/regions/Cov_data_triple.RDS")
+#total <- dtuCG$total
+#saveRDS(total, "./input/total.RDS")
+#total <- total %>% as.data.table() %>% setnames("TT_S0", "TT_S0_deep") 
+pavadinimai <- c("lGC", "lGCCG", "gGC", "gGCCG")
+```
+
+# 2.1 Regionų persidengimo palyginimas
+
+```{r}
+atac <- fread("/mnt/store/DMTS/mESC_openChrom/regions/PublishedData/APEAKS004733_MACS2_230.bed") %>%
+  setnames(c("seqnames", "start", "end", "summit", "tags", "pvalue", "enrichment", "qvalue", "id"))
+dna <- fread("/mnt/store/DMTS/mESC_openChrom/regions/PublishedData/DPEAKS000448_rep1_MACS2_230.bed") %>%
+    setnames(c("seqnames", "start", "end", "summit", "tags", "pvalue", "enrichment", "qvalue", "id"))
+atac$seqnames <- gsub("^chr", "", atac$seqnames)
+dna$seqnames <- gsub("^chr", "", dna$seqnames)
+sets <- c(1:4)
+lentele <- foreach(i = sets, .combine = 'rbind') %do% {
+  print(i)
+dt <- readRDS(file_names[i]) 
+dt[[1]] %>% as.data.table() %>% select(width) %>% mutate(rinkinys = paste0(i))
+ } 
+lentele$rinkinys <- factor(lentele$rinkinys, 
+  levels = c("1", "2", "3", "4"), 
+  labels = pavadinimai)  
+atac <- atac %>% as.data.table() %>% mutate(width = end-start, rinkinys = paste0("ATAC-Seq")) %>% select(width, rinkinys)
+dna <- dna %>% as.data.table() %>% mutate(width = end-start, rinkinys = paste0("DNase-Seq")) %>% select(width, rinkinys)
+full_dt <- rbind(lentele, atac, dna)
+
+#df_p_val_1 <- full_dt %>% 
+#  rstatix:: wilcox_test(width~rinkinys) 
+
+
+bonus <- ggplot(full_dt, aes(x = rinkinys, y = width)) + geom_boxplot(fill = "#1b9e77") +
+  theme_bw() + scale_y_continuous(trans = 'log10') + labs(
+    x = "Rinkinys",
+    y = "Regiono ilgis (bp)"
+  ) + theme(axis.text.x = element_text(size = 16, angle = 45, vjust= 1, hjust = 1),
+        axis.text.y = element_text(size = 14),
+        axis.title = element_text(size = 18),
+        title = element_text(size = 22)) 
+
+medianos <- full_dt %>% group_by(rinkinys) %>% 
+  summarise(mediana = median(width)) %>% .$mediana
+
+
+
+print(paste0("Ilgio pasiskirstymo medianos vertės svyruoja nuo ", min(medianos), " iki ", max(medianos)))
+
+ggsave(filename = "output/code/prepdata/paveikslai/bakalauras_bonus/2_1_ATAC_persidengimas_skaicius_ilgis.png",
+                plot = bonus, width = 420, height = 210, units = "mm")
+
+
+atac <- fread("/mnt/store/DMTS/mESC_openChrom/regions/PublishedData/APEAKS004733_MACS2_230.bed") %>%
+  setnames(c("seqnames", "start", "end", "summit", "tags", "pvalue", "enrichment", "qvalue", "id"))
+dna <- fread("/mnt/store/DMTS/mESC_openChrom/regions/PublishedData/DPEAKS000448_rep1_MACS2_230.bed") %>%
+    setnames(c("seqnames", "start", "end", "summit", "tags", "pvalue", "enrichment", "qvalue", "id"))
+atac$seqnames <- gsub("^chr", "", atac$seqnames)
+dna$seqnames <- gsub("^chr", "", dna$seqnames)
+
+outFile <- paste0(outdatadir, "regionu_persidengimas_ATACandDNaseNEW.Rds") 
+if(!(file.exists(outFile))) {
+sets <- c(1:4)
+atac_dt <- foreach(i = sets, .combine = 'cbind') %do% {
+  print(i)
+dt <- readRDS(file_names[i]) 
+tmp1 <- dt[[1]] %>% as.data.table() %>%   
+               select(seqnames, start, end, width, strand) %>%
+               regionbin() %>%
+              makeGRangesFromDataFrame(keep.extra.columns = TRUE)
+atac <- fread("/mnt/store/DMTS/mESC_openChrom/regions/PublishedData/APEAKS004733_MACS2_230.bed") %>%
+  setnames(c("seqnames", "start", "end", "summit", "tags", "pvalue", "enrichment", "qvalue", "id")) 
+atac$seqnames <- gsub("^chr", "", atac$seqnames)
+atac <- atac %>% select(seqnames, start, end) %>% makeGRangesFromDataFrame(keep.extra.columns = TRUE)
+good <- countOverlaps(atac, tmp1) 
+matched <- atac[good > 0] %>% as.data.table()
+final <- nrow(matched) / nrow(as.data.table(atac)) %>%
+as.data.table() %>% setnames(paste0(i, "_atac"))
+}
+dna_dt <- foreach(i = sets, .combine = 'cbind') %do% {
+  print(i)
+dt <- readRDS(file_names[i]) 
+tmp1 <- dt[[1]] %>% as.data.table() %>%   
+               select(seqnames, start, end, width, strand) %>%
+               regionbin() %>%
+              makeGRangesFromDataFrame(keep.extra.columns = TRUE)
+dna <- fread("/mnt/store/DMTS/mESC_openChrom/regions/PublishedData/DPEAKS000448_rep1_MACS2_230.bed") %>%
+    setnames(c("seqnames", "start", "end", "summit", "tags", "pvalue", "enrichment", "qvalue", "id"))
+dna$seqnames <- gsub("^chr", "", dna$seqnames)
+dna <- dna %>% select(seqnames, start, end) %>% makeGRangesFromDataFrame(keep.extra.columns = TRUE)
+good <- countOverlaps(dna, tmp1) 
+matched <- dna[good > 0] %>% as.data.table()
+final <- nrow(matched) / nrow(as.data.table(dna)) %>%
+as.data.table() %>% setnames(paste0(i, "_dnase"))
+}
+both <- findOverlaps(atac, dna)
+bothwidth <- pintersect(atac[queryHits(both)], dna[subjectHits(both)]) %>% 
+  as.data.table() %>% makeGRangesFromDataFrame(keep.extra.columns = TRUE)
+both_dt <- foreach(i = sets, .combine = 'cbind') %do% {
+  print(i)
+dt <- readRDS(file_names[i]) 
+tmp1 <- dt[[1]] %>% as.data.table() %>%   
+               select(seqnames, start, end, width, strand) %>%
+               regionbin() %>%
+              makeGRangesFromDataFrame(keep.extra.columns = TRUE)
+good <- countOverlaps(bothwidth, tmp1) 
+matched <- bothwidth[good > 0] %>% as.data.table()
+final <- nrow(matched) / nrow(as.data.table(bothwidth)) %>%
+as.data.table() %>% setnames(paste0(i, "_both"))
+}
+
+full_dt <- cbind(atac_dt, dna_dt, both_dt) %>% pivot_longer(cols = everything(), names_to = c("rinkinys", "metodas"), 
+ names_sep = "_")
+
+saveRDS(full_dt, outFile)
+}
+
+full_dt <- readRDS(outFile)
+
+full_dt$rinkinys <- factor(full_dt$rinkinys, 
+  levels = c("1", "2", "3", "4"), 
+  labels = pavadinimai)
+full_dt <- full_dt %>% filter(metodas != 'both')
+full_dt$metodas <- factor(full_dt$metodas, 
+  levels = c("atac", "dnase"),
+  labels = c("ATAC-Seq", "DNase-Seq"))
+gg1 <- ggplot(full_dt, aes(x = rinkinys, y = value, fill = metodas)) + 
+  geom_col(position = 'dodge', color = 'black') + scale_fill_brewer(palette = 'Dark2') + theme_bw() + 
+  #facet_grid(cols = vars(metodas)) + 
+  scale_y_continuous(limits = c(0,1)) + 
+  #theme(legend.position = 'none') +
+  labs(
+    fill = "Lygintas metodas",
+    y = "Persidengusių regionų skaičiaus dalis",
+    x = "TOP-Seq rinkinys",
+    title = "a"
+  ) + theme(axis.text.x = element_text(size = 16, angle = 45, vjust= 1, hjust = 1),
+        axis.text.y = element_text(size = 14),
+        axis.title = element_text(size = 18),
+        title = element_text(size = 22),
+        legend.key.size = unit(1, 'cm'), 
+        legend.title = element_text(size= 18), 
+        legend.text = element_text(size=16)) 
+gg1
+
+full_dt %>% group_by(metodas) %>% 
+summarise(min = min(value), max = max(value))
+
+
+
+outFile <- paste0(outdatadir, "regionu_persidengimas_ilgis_ATACandDNaseNEW.Rds") 
+if(!(file.exists(outFile))) {
+sets <- c(1:4)
+atac_dt <- foreach(i = sets, .combine = 'cbind') %do% {
+  print(i)
+dt <- readRDS(file_names[i]) 
+tmp1 <- dt[[1]] %>% as.data.table() %>%   
+               select(seqnames, start, end, width, strand) %>%
+               regionbin() %>%
+              makeGRangesFromDataFrame(keep.extra.columns = TRUE)
+atac <- fread("/mnt/store/DMTS/mESC_openChrom/regions/PublishedData/APEAKS004733_MACS2_230.bed") %>%
+  setnames(c("seqnames", "start", "end", "summit", "tags", "pvalue", "enrichment", "qvalue", "id")) 
+atac$seqnames <- gsub("^chr", "", atac$seqnames)
+atac <- atac %>% select(seqnames, start, end) %>% makeGRangesFromDataFrame()
+overlapped <- findOverlaps(atac, tmp1)
+overlapwidth <- pintersect(atac[queryHits(overlapped)], tmp1[subjectHits(overlapped)]) %>% 
+  as.data.table()
+all_width <- atac[queryHits(overlapped)] %>% as.data.table() 
+final <- sum(overlapwidth$width) / sum(all_width$width) %>%
+  as.data.table() %>% setnames(paste0(i, "_atac"))
+}
+dna_dt <- foreach(i = sets, .combine = 'cbind') %do% {
+  print(i)
+dt <- readRDS(file_names[i]) 
+tmp1 <- dt[[1]] %>% as.data.table() %>%   
+               select(seqnames, start, end, width, strand) %>%
+               regionbin() %>%
+              makeGRangesFromDataFrame(keep.extra.columns = TRUE)
+dna <- fread("/mnt/store/DMTS/mESC_openChrom/regions/PublishedData/DPEAKS000448_rep1_MACS2_230.bed") %>%
+    setnames(c("seqnames", "start", "end", "summit", "tags", "pvalue", "enrichment", "qvalue", "id"))
+dna$seqnames <- gsub("^chr", "", dna$seqnames)
+dna <- dna %>% select(seqnames, start, end) %>% makeGRangesFromDataFrame()
+overlapped <- findOverlaps(dna, tmp1)
+overlapwidth <- pintersect(dna[queryHits(overlapped)], tmp1[subjectHits(overlapped)]) %>% 
+  as.data.table()
+all_width <- dna[queryHits(overlapped)] %>% as.data.table() 
+final <- sum(overlapwidth$width) / sum(all_width$width) %>%
+  as.data.table() %>% setnames(paste0(i, "_dnase"))
+}
+both <- findOverlaps(atac, dna)
+bothwidth <- pintersect(atac[queryHits(both)], dna[subjectHits(both)]) %>% 
+  as.data.table() %>% makeGRangesFromDataFrame(keep.extra.columns = TRUE)
+both_dt <- foreach(i = sets, .combine = 'cbind') %do% {
+  print(i)
+dt <- readRDS(file_names[i]) 
+tmp1 <- dt[[1]] %>% as.data.table() %>%   
+               select(seqnames, start, end, width, strand) %>%
+               regionbin() %>%
+              makeGRangesFromDataFrame(keep.extra.columns = TRUE)
+overlapped <- findOverlaps(bothwidth, tmp1)
+overlapwidth <- pintersect(bothwidth[queryHits(overlapped)], tmp1[subjectHits(overlapped)]) %>% 
+  as.data.table()
+all_width <- bothwidth[queryHits(overlapped)] %>% as.data.table() 
+final <- sum(overlapwidth$width) / sum(all_width$width) %>%
+  as.data.table() %>% setnames(paste0(i, "_both"))
+}
+
+
+
+full_dt <- cbind(atac_dt, dna_dt, both_dt) %>% pivot_longer(cols = everything(), names_to = c("rinkinys", "metodas"), 
+ names_sep = "_")
+
+saveRDS(full_dt, outFile)
+}
+
+full_dt2 <- readRDS(outFile)
+
+full_dt$rinkinys <- factor(full_dt$rinkinys, 
+  levels = c("1", "2", "3", "4"), 
+  labels = pavadinimai)
+full_dt <- full_dt %>% filter(metodas != 'both')
+full_dt$metodas <- factor(full_dt$metodas, 
+  levels = c("atac", "dnase"),
+  labels = c("ATAC-Seq", "DNase-Seq"))
+gg2 <- ggplot(full_dt, aes(x = rinkinys, y = value, fill = metodas)) + 
+  geom_col(position = 'dodge', color = 'black') + scale_fill_brewer(palette = 'Dark2') + theme_bw() + 
+  #facet_grid(cols = vars(metodas)) + 
+  scale_y_continuous(limits = c(0,1)) + 
+  #theme(legend.position = 'none') +
+  labs(
+    y = "Persidengusių regionų ilgio dalis",
+    x = "TOP-Seq rinkinys",
+    fill = "Lygintas metodas",
+    title = "b"
+  ) + theme(axis.text.x = element_text(size = 16, angle = 45, vjust= 1, hjust = 1),
+        axis.text.y = element_text(size = 14),
+        axis.title = element_text(size = 18),
+        title = element_text(size = 22),
+        legend.key.size = unit(1, 'cm'), 
+        legend.title = element_text(size= 18), 
+        legend.text = element_text(size=16)) 
+gg2 
+
+p <- ggarrange(gg1, gg2, common.legend = TRUE)
+
+ggsave(filename = "output/code/prepdata/paveikslai/bakalauras/2_1_ATAC_persidengimas_skaicius_ilgis.png",
+                plot = p, width = 420, height = 210, units = "mm")
+
+```
+
+# 2.2 Persidengimo dalis
+
+```{r}
+### Kokia regiono dalis persidengia. 
+outFile <- paste0(outdatadir, "regionu_persidengimo_dalis_ATACandDNaseNEW.Rds") 
+if(!(file.exists(outFile))) {
+sets <- c(1:4)
+atac_dt <- foreach(i = sets) %do% {
+  print(i)
+dt <- readRDS(file_names[i]) 
+tmp1 <- dt[[1]] %>% as.data.table() %>%   
+               select(seqnames, start, end, width, strand) %>%
+              makeGRangesFromDataFrame(keep.extra.columns = TRUE)
+atac <- fread("/mnt/store/DMTS/mESC_openChrom/regions/PublishedData/APEAKS004733_MACS2_230.bed") %>%
+  setnames(c("seqnames", "start", "end", "summit", "tags", "pvalue", "enrichment", "qvalue", "id")) 
+atac$seqnames <- gsub("^chr", "", atac$seqnames)
+atac <- atac %>% select(seqnames, start, end) %>% regionbin() %>% makeGRangesFromDataFrame(keep.extra.columns = TRUE)
+overlapped <- findOverlaps(atac, tmp1)
+overlapwidth <- pintersect(atac[queryHits(overlapped)], tmp1[subjectHits(overlapped)])
+percentOverlap <- width(overlapwidth) / width(atac[queryHits(overlapped)]) %>% 
+  as.data.table() 
+percentOverlap <- percentOverlap %>% setnames(paste0(i, "_atac")) 
+final <- atac[queryHits(overlapped)] %>% as.data.table() 
+final$perc <- percentOverlap 
+final <- final %>% select(regionID, perc) %>% setnames(c("regionID", paste0(i, "_atac"))) 
+}
+atac_dt <- Reduce(full_join, atac_dt) %>% 
+  pivot_longer(., cols = -regionID, names_to = c("rinkinys", "metodas"), names_sep = "_")
+atac_dt <- atac_dt[complete.cases(atac_dt),]
+
+dna_dt <- foreach(i = sets) %do% {
+  print(i)
+dt <- readRDS(file_names[i]) 
+tmp1 <- dt[[1]] %>% as.data.table() %>%   
+               select(seqnames, start, end, width, strand) %>%
+              makeGRangesFromDataFrame(keep.extra.columns = TRUE)
+dna <- fread("/mnt/store/DMTS/mESC_openChrom/regions/PublishedData/DPEAKS000448_rep1_MACS2_230.bed") %>%
+    setnames(c("seqnames", "start", "end", "summit", "tags", "pvalue", "enrichment", "qvalue", "id"))
+dna$seqnames <- gsub("^chr", "", dna$seqnames)
+dna <- dna %>% select(seqnames, start, end) %>% regionbin() %>% makeGRangesFromDataFrame(keep.extra.columns = TRUE)
+overlapped <- findOverlaps(dna, tmp1)
+overlapwidth <- pintersect(dna[queryHits(overlapped)], tmp1[subjectHits(overlapped)])
+percentOverlap <- width(overlapwidth) / width(dna[queryHits(overlapped)]) %>% 
+  as.data.table() 
+percentOverlap <- percentOverlap %>% setnames(paste0(i, "_dna")) 
+final <- dna[queryHits(overlapped)] %>% as.data.table() 
+final$perc <- percentOverlap 
+final <- final %>% select(regionID, perc) %>% setnames(c("regionID", paste0(i, "_dna"))) 
+}
+dna_dt <- Reduce(full_join, dna_dt) %>% 
+  pivot_longer(., cols = -regionID, names_to = c("rinkinys", "metodas"), names_sep = "_")
+dna_dt <- dna_dt[complete.cases(dna_dt),]
+
+both <- findOverlaps(atac, dna)
+bothwidth <- pintersect(atac[queryHits(both)], dna[subjectHits(both)]) %>% 
+  as.data.table() %>% makeGRangesFromDataFrame(keep.extra.columns = TRUE)
+both_dt <- foreach(i = sets) %do% {
+  print(i)
+dt <- readRDS(file_names[i]) 
+tmp1 <- dt[[1]] %>% as.data.table() %>%   
+               select(seqnames, start, end, width, strand) %>%
+               regionbin() %>%
+              makeGRangesFromDataFrame(keep.extra.columns = TRUE)
+overlapped <- findOverlaps(bothwidth, tmp1)
+overlapwidth <- pintersect(bothwidth[queryHits(overlapped)], tmp1[subjectHits(overlapped)]) 
+percentOverlap <- width(overlapwidth) / width(bothwidth[queryHits(overlapped)]) %>% 
+  as.data.table()
+percentOverlap <- percentOverlap %>% setnames(paste0(i, "_both")) 
+final <- bothwidth[queryHits(overlapped)] %>% as.data.table() 
+final$perc <- percentOverlap 
+final <- final %>% select(regionID, perc) %>% setnames(c("regionID", paste0(i, "_both"))) 
+}
+both_dt <- Reduce(full_join, both_dt) %>% 
+  pivot_longer(., cols = -regionID, names_to = c("rinkinys", "metodas"), names_sep = "_")
+both_dt <- both_dt[complete.cases(both_dt),]
+full_dt <- rbind(atac_dt, dna_dt, both_dt)
+saveRDS(full_dt, outFile)
+}
+
+full_dt <- readRDS(outFile)
+
+full_dt$rinkinys <- factor(full_dt$rinkinys, 
+  levels = c("1", "2", "3", "4"), 
+  labels = pavadinimai)
+full_dt <- full_dt %>% filter(metodas != 'both')
+full_dt$metodas <- factor(full_dt$metodas, 
+  levels = c("atac", "dna"),
+  labels = c("ATAC-Seq", "DNase-Seq"))
+
+###
+
+
+ATACl0.5 <- full_dt %>% filter(rinkinys == "lGCCG" & metodas == "ATAC-Seq" & value < 0.5) %>% nrow()
+ATACl1 <- full_dt %>% filter(rinkinys == "lGCCG" & metodas == "ATAC-Seq") %>% nrow()
+DNAl0.5 <- full_dt %>% filter(rinkinys == "lGCCG" & metodas == "DNase-Seq" & value < 0.5) %>% nrow()
+DNAl1 <- full_dt %>% filter(rinkinys == "lGCCG" & metodas == "DNase-Seq") %>% nrow()
+
+mean(c(ATACl0.5/ATACl1), (DNAl0.5/DNAl1))
+
+stat_dt <- full_dt %>% group_by(rinkinys, metodas) %>% summarise(
+  mediana = median(value),
+  sd = sd(value)
+)
+
+###
+
+
+###
+p2 <- ggplot(full_dt, aes(x = rinkinys, y = value, fill = metodas)) + 
+  geom_boxplot() + theme_bw()  + scale_fill_brewer(palette = 'Dark2') + labs(
+    title = "",
+    x = "Duomenų rinkinys",
+    y = "Persidengusio regiono dalis",
+    fill = "Lygintas metodas"
+  ) + theme(axis.text.x = element_text(size = 16, angle = 45, vjust= 1, hjust = 1),
+        axis.text.y = element_text(size = 14),
+        axis.title = element_text(size = 18),
+        title = element_text(size = 22),
+        legend.key.size = unit(1, 'cm'), 
+        legend.title = element_text(size= 18), 
+        legend.text = element_text(size=16)) 
+
+
+full_dt %>% group_by(rinkinys, metodas) %>% summarise(median = median(value))
+
+
+bonus <- ggplot(full_dt, aes(x = value, fill = metodas)) + 
+  geom_density(alpha = 0.7) + theme_bw()  + scale_fill_brewer(palette = 'Dark2') + 
+  facet_wrap(~rinkinys, scales = 'free') + 
+  labs(
+    title = "",
+    x = "Persidengimo frakcija",
+    y = "Tankio vertė",
+    fill = "Lygintas metodas"
+  ) 
+
+
+my_comparisons <- list( c("lGC", "gGC"), 
+                        c("lGCCG", "gGCCG"))
+
+p2 <- p2 + stat_compare_means(method = "wilcox.test", label = "p.signif", comparisons = my_comparisons) +  
+  theme( strip.text.x = element_text(size = 16),
+        axis.text.x = element_text(size = 14, angle = 45, vjust= 1, hjust = 1),
+        axis.text.y = element_text(size = 14),
+        axis.title = element_text(size = 18),
+        title = element_text(size = 22),
+        legend.key.size = unit(1, 'cm'), 
+        legend.title = element_text(size= 18), 
+        legend.text = element_text(size=16)) 
+
+ggsave(filename = "output/code/prepdata/paveikslai/bakalauras/2_2_ATAC_persidengimo_dalis.png",
+                plot = p2, width = 420, height = 210, units = "mm")
+
+
+ggsave(filename = "output/code/prepdata/paveikslai/bakalauras_bonus/2_2_ATAC_persidengimo_dalis_tankis.png",
+                plot = bonus, width = 420, height = 210, units = "mm")
+
+```
+
+# 2.3 Persidengusių regionų tehcninė analizė
+
+```{r}
+outFile <- paste0(outdatadir, "persidengiantis_unikalus_ATAC_DNase_ilgisNEW.Rds")
+sets <- c(1:4)
+group <- c("atac", "dnase", "active", "atac+active", "dnase+active")
+if(!(file.exists(outFile))) {
+atac <- fread("/mnt/store/DMTS/mESC_openChrom/regions/PublishedData/APEAKS004733_MACS2_230.bed") %>%
+  setnames(c("seqnames", "start", "end", "summit", "tags", "pvalue", "enrichment", "qvalue", "id")) 
+atac$seqnames <- gsub("^chr", "", atac$seqnames)
+atac$seqnames <- gsub("^chr", "", atac$seqnames)
+atac <- atac %>% select(seqnames, start, end) %>% makeGRangesFromDataFrame()
+dna <- fread("/mnt/store/DMTS/mESC_openChrom/regions/PublishedData/DPEAKS000448_rep1_MACS2_230.bed") %>%
+    setnames(c("seqnames", "start", "end", "summit", "tags", "pvalue", "enrichment", "qvalue", "id"))
+dna$seqnames <- gsub("^chr", "", dna$seqnames)
+dna <- dna %>% select(seqnames, start, end) %>% makeGRangesFromDataFrame()
+both <- findOverlaps(atac, dna)
+bothwidth <- pintersect(atac[queryHits(both)], dna[subjectHits(both)]) %>% 
+  as.data.table() %>% makeGRangesFromDataFrame(keep.extra.columns = TRUE)
+lentele <- foreach(i = sets) %do% {
+  print(i)
+dt <- readRDS(file_names[i]) 
+tmp1 <- dt[[1]] %>% as.data.table() %>%
+               select(seqnames, start, end, width, strand) %>%
+               regionbin() %>%
+              makeGRangesFromDataFrame(keep.extra.columns = TRUE)
+foreach(j = group) %do% {
+    if (j == "atac") {
+      good <- countOverlaps(atac, tmp1) 
+      matched <- atac[good == 0] %>% as.data.table() %>% regionbin() %>%
+        select(regionID, width) %>% setnames("width", paste0(i, "_atac"))
+    } else if (j == "dnase") {
+      good <- countOverlaps(dna, tmp1) 
+      matched <- dna[good == 0] %>% as.data.table() %>% regionbin() %>%
+        select(regionID, width) %>% setnames("width", paste0(i, "_dnase")) 
+    } else if (j == "active") {
+      good <- countOverlaps(tmp1, atac) 
+      matched <- tmp1[good == 0] 
+      good <- countOverlaps(matched, dna)
+      matched <- matched[good == 0] %>% as.data.table() %>% regionbin() %>%
+        select(regionID, width) %>% setnames("width", paste0(i, "_active"))
+    } else if (j == "atac+active") {
+      good <- countOverlaps(tmp1, atac) 
+      matched <- tmp1[good > 0] %>% as.data.table() %>% regionbin() %>%
+        select(regionID, width) %>% setnames("width", paste0(i, "_atac+active"))
+    } else if (j == "dnase+active") {
+      good <- countOverlaps(tmp1, dna) 
+      matched <- tmp1[good > 0] %>% as.data.table() %>% regionbin() %>%
+        select(regionID, width) %>% setnames("width", paste0(i, "_dnase+active")) 
+    }
+}}
+numkeep <- c(1:4)
+linked_sample <- foreach(i = numkeep) %do% {
+Reduce(full_join, lentele[[i]]) %>% 
+  pivot_longer(cols = -regionID, 
+  names_to = c("rinkinys", "grupe"), names_sep = "_") 
+}
+
+full_dt <- Reduce(rbind, linked_sample)
+full_dt <- full_dt[complete.cases(full_dt),]
+saveRDS(full_dt, outFile)
+}
+
+full_dt <- readRDS(outFile)
+full_dt$rinkinys <- factor(full_dt$rinkinys, 
+  levels = c("1", "2", "3", "4"), 
+  labels = pavadinimai)
+full_dt$grupe <- factor(full_dt$grupe, 
+  levels = group, 
+  labels =c("ATAC-Seq", "DNase-Seq", "TOP-Seq", 
+  "TOP-Seq +\nATAC-Seq", "TOP-Seq +\nDNase-Seq"))
+full_dt <- full_dt %>% filter(!(grupe %in% c("ATAC-Seq", "DNase-Seq")))
+p3 <- ggplot(full_dt, aes(x = grupe, y = value, fill = grupe)) + 
+ geom_boxplot() + theme_bw()  + scale_fill_brewer(palette = 'Dark2') + 
+  facet_grid(cols = vars(rinkinys)) + 
+  scale_y_continuous(trans = 'log10') +
+  labs(
+    title = "",
+    y = "Regiono ilgis (bp)",
+    x = "",
+    fill = "Regionų aibė",
+  ) 
+my_comparisons <- list( c("TOP-Seq", "TOP-Seq +\nATAC-Seq"), 
+                        c("TOP-Seq", "TOP-Seq +\nDNase-Seq"))
+
+
+p3 <- p3 + stat_compare_means(method = "wilcox.test", label = "p.signif", comparisons = my_comparisons) +
+     theme( strip.text.x = element_text(size = 16),
+        axis.text.x = element_text(size = 14, angle = 45, vjust= 1, hjust = 1),
+        axis.text.y = element_text(size = 14),
+        axis.title = element_text(size = 18),
+        title = element_text(size = 22),
+        legend.key.size = unit(1, 'cm'), 
+        legend.title = element_text(size= 18), 
+        legend.text = element_text(size=16)) 
+
+full_dt %>% group_by(rinkinys, grupe) %>% summarise(vidurkis = mean(value))
+
+
+ggsave(filename = "output/code/prepdata/paveikslai/bakalauras_bonus/2_3_ATAC_persidengusiu_ilgis.png",
+                plot = p3, width = 420, height = 210, units = "mm")
+p3
+
+
+outFile <- paste0(outdatadir, "persidengiantis_unikalus_ATAC_DNase_elementasNEW.Rds")
+sets <- c(1:4)
+elementai <- c("Promoter", "CGIall", "exon", "intron", 
+  "UTR3", "UTR5", "Rpt", "intergenic")
+group <- c("atac", "dnase", "atac+active", "dnase+active")
+if(!(file.exists(outFile))) {
+dtanno <- readRDS("./input/data_annotation_final.RDS")
+dtanno$chr <- gsub("^chr", "", dtanno$chr)
+dtanno$element <- gsub(" ", "", dtanno$element)
+dtanno$element <- gsub("_", "", dtanno$element)
+dtanno <- dtanno %>% rename(chr = "seqnames")
+atac <- fread("/mnt/store/DMTS/mESC_openChrom/regions/PublishedData/APEAKS004733_MACS2_230.bed") %>%
+  setnames(c("seqnames", "start", "end", "summit", "tags", "pvalue", "enrichment", "qvalue", "id")) 
+atac$seqnames <- gsub("^chr", "", atac$seqnames)
+atac <- atac %>% select(seqnames, start, end) %>% makeGRangesFromDataFrame()
+dna <- fread("/mnt/store/DMTS/mESC_openChrom/regions/PublishedData/DPEAKS000448_rep1_MACS2_230.bed") %>%
+    setnames(c("seqnames", "start", "end", "summit", "tags", "pvalue", "enrichment", "qvalue", "id"))
+dna$seqnames <- gsub("^chr", "", dna$seqnames)
+dna <- dna %>% select(seqnames, start, end) %>% makeGRangesFromDataFrame()
+both <- findOverlaps(atac, dna)
+bothwidth <- pintersect(atac[queryHits(both)], dna[subjectHits(both)]) %>% 
+  as.data.table() %>% makeGRangesFromDataFrame(keep.extra.columns = TRUE)
+lentele <- foreach(i = sets) %do% {
+  print(i)
+dt <- readRDS(file_names[i]) 
+tmp1 <- dt[[1]] %>% as.data.table() %>%
+               select(seqnames, start, end, width, strand) %>%
+               regionbin() %>%
+              makeGRangesFromDataFrame(keep.extra.columns = TRUE)
+foreach(j = group) %do% {
+    if (j == "atac") {
+      good <- countOverlaps(atac, tmp1) 
+      matched <- atac[good == 0]
+    } else if (j == "dnase") {
+      good <- countOverlaps(dna, tmp1) 
+      matched <- dna[good == 0] 
+    } else if (j == "atac+active") {
+      good <- countOverlaps(atac, tmp1) 
+      matched <- atac[good > 0] 
+    } else if (j == "dnase+active") {
+      good <- countOverlaps(dna, tmp1) 
+      matched <- dna[good > 0] 
+    }
+  foreach(z = elementai) %do% {
+    print(z)
+     anno <- dtanno %>% filter(grepl(z, element)) %>% makeGRangesFromDataFrame()
+    good_element <- countOverlaps(anno, matched)
+    matched_element <- anno[good_element > 0] 
+    final <- nrow(as.data.table(matched_element)) / nrow(as.data.table(anno)) %>%
+        as.data.table() %>% setnames(paste0(i, "_", z, "_", j))
+}}}
+num_keep1 <- 1:4
+num_keep2 <- 1:4
+linked_sample <- foreach(i = num_keep1) %do% {
+    foreach(j = num_keep2) %do% {
+Reduce(cbind, lentele[[i]][[j]])  %>%
+   pivot_longer(cols = everything(), names_to = c("rinkinys", "elementas", "grupe"), 
+               names_sep= "_") %>% setnames("value", "frakcija")
+}}
+num_keep <- 1:4
+linked_sample <- foreach(i = num_keep) %do% {
+Reduce(rbind, linked_sample[[i]]) 
+}
+
+full_dt <- Reduce(rbind, linked_sample)
+saveRDS(full_dt, outFile)
+}
+
+full_dt <- readRDS(outFile)
+full_dt$rinkinys <- factor(full_dt$rinkinys, 
+  levels = c("1", "2", "3", "4"), 
+  labels = pavadinimai)
+
+regions <- c("lGCCG")
+test <- full_dt %>% filter(rinkinys %in% regions) 
+test <- test %>% mutate(metodas = case_when(
+  grepl("atac", grupe) ~ "atac",
+  grepl("dnase", grupe) ~ "dnase" 
+))
+
+test$elementas  <- factor(test$elementas , levels = elementai,
+  labels = c("Promotorius", "CG sala", "Egzonas", "Intronas", "UTR3", "UTR5",
+    "Kartotinės sekos", "Intergeninis"))
+test$grupe <- factor(test$grupe, levels = group,
+                      labels = c("Specifiniai ATAC-Seq", 
+                        "Specifiniai DNase-Seq",
+                        "Bendri TOP-Seq\nir ATAC-Seq",
+                        "Bendri TOP-Seq\nir DNase-Seq"))
+test <- test %>% filter(elementas != "Intergeninis")
+p4_1 <- ggplot(test, aes(x = elementas, y = frakcija, fill = grupe)) + 
+  geom_col(position = 'dodge', color = 'black') + scale_fill_brewer(palette = 'Dark2') + theme_bw() + 
+  #facet_grid(cols = vars(rinkinys)) + 
+  #scale_y_continuous(limits = c(0,1)) + 
+  #theme(legend.position = 'none') +
+  labs(
+    y = "Persidengusių genominių elementų dalis",
+    x = "Genominis elementas",
+    fill = "Regionų aibės"
+  ) + 
+  theme( strip.text.x = element_text(size = 16),
+        axis.text.x = element_text(size = 14, angle = 45, vjust= 1, hjust = 1),
+        axis.text.y = element_text(size = 14),
+        axis.title = element_text(size = 18),
+        title = element_text(size = 22),
+        legend.key.size = unit(1, 'cm'), 
+        legend.title = element_text(size= 18), 
+        legend.text = element_text(size=16)) 
+
+stats <- test %>% group_by(grupe, elementas) %>%  summarise(vidurkis = mean(frakcija)) %>%
+  mutate(grupe = case_when(
+    grupe %in% c("Specifiniai ATAC-Seq", "Specifiniai DNase-Seq") ~ "unikalus",
+    grupe %in% c("Bendri TOP-Seq\nir ATAC-Seq",  "Bendri TOP-Seq\nir DNase-Seq") ~ "bendras"
+  )) %>% group_by(grupe, elementas) %>% summarise(vidurkis = mean(vidurkis)) %>%
+  pivot_wider(names_from = grupe, values_from = vidurkis) %>% mutate(skirtumas = bendras/unikalus)
+  
+
+
+full_dt$elementas  <- factor(full_dt$elementas , levels = elementai,
+  labels = c("Promotorius", "CG sala", "Egzonas", "Intronas", "UTR3", "UTR5",
+    "Kartotinės sekos", "Intergeninis"))
+full_dt$grupe <- factor(full_dt$grupe, levels = group,
+                      labels = c("Specifiniai ATAC-Seq", 
+                        "Specifiniai DNase-Seq",
+                        "Bendri TOP-Seq\nir ATAC-Seq",
+                        "Bendri TOP-Seq\nir DNase-Seq"))
+full_dt <- full_dt %>% filter(elementas != "Intergeninis")
+p4_2 <- ggplot(full_dt, aes(x = elementas, y = frakcija, fill = grupe)) + 
+  geom_col(position = 'dodge', color = 'black') + scale_fill_brewer(palette = 'Dark2') + theme_bw() + 
+  facet_grid(cols = vars(rinkinys)) + 
+  #scale_y_continuous(limits = c(0,1)) + 
+  #theme(legend.position = 'none') +
+  labs(
+    y = "Persidengusių genominių elementų dalis",
+    x = "Genominis elementas",
+    fill = "Regionų aibės"
+  ) +    theme( strip.text.x = element_text(size = 16),
+        axis.text.x = element_text(size = 14, angle = 45, vjust= 1, hjust = 1),
+        axis.text.y = element_text(size = 14),
+        axis.title = element_text(size = 18),
+        title = element_text(size = 22),
+        legend.key.size = unit(1, 'cm'), 
+        legend.title = element_text(size= 18), 
+        legend.text = element_text(size=16)) 
+
+
+
+ggsave(filename = "output/code/prepdata/paveikslai/bakalauras/2_4_ATAC_persidengusiu_elementai.png",
+                plot = p4_1, width = 420, height = 210, units = "mm")
+
+ggsave(filename = "output/code/prepdata/paveikslai/bakalauras_bonus/2_4_ATAC_persidengusiu_elementai_visi.png",
+                plot = p4_2, width = 420, height = 210, units = "mm")
+p4_1
+
+test
+```
